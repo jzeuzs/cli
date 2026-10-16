@@ -1,7 +1,7 @@
 use super::*;
 use crate::client::post_graphql;
-use crate::controllers::environment::get_matched_environment;
-use crate::controllers::project::{ensure_project_and_environment_exist, get_project};
+use crate::commands::output::limit::clamp_list_limit;
+use crate::controllers::project::resolve_service_context;
 use crate::gql::queries::deployments::{DeploymentStatus, ResponseData, Variables};
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
@@ -19,10 +19,11 @@ pub struct Args {
 #[derive(Parser)]
 enum Commands {
     /// List deployments for a service with IDs, statuses and other metadata
-    #[clap(alias = "ls")]
+    #[clap(visible_alias = "ls")]
     List(ListArgs),
 
     /// Upload and deploy project from the current directory
+    #[clap(visible_alias = "deploy")]
     Up(crate::commands::up::Args),
 
     /// Redeploy the latest deployment of a service
@@ -38,6 +39,10 @@ struct ListArgs {
     /// Environment to list deployments from (defaults to linked environment)
     #[clap(short, long)]
     environment: Option<String>,
+
+    /// Project ID or name to list deployments from (defaults to linked project)
+    #[clap(short = 'p', long, value_name = "PROJECT")]
+    project: Option<String>,
 
     /// Maximum number of deployments to show (default: 20, max: 1000)
     #[clap(long, default_value = "20")]
@@ -61,6 +66,7 @@ pub async fn command(args: Args) -> Result<()> {
     match args.command {
         Commands::List(list_args) => {
             list_deployments(
+                list_args.project,
                 list_args.service,
                 list_args.environment,
                 list_args.limit,
@@ -80,55 +86,26 @@ pub async fn command(args: Args) -> Result<()> {
 }
 
 async fn list_deployments(
+    project: Option<String>,
     service: Option<String>,
     environment: Option<String>,
     limit: i64,
     json: bool,
 ) -> Result<()> {
-    let configs = Configs::new()?;
-    let client = GQLClient::new_authorized(&configs)?;
-    let linked_project = configs.get_linked_project().await?;
+    let limit = clamp_list_limit(limit);
 
-    ensure_project_and_environment_exist(&client, &configs, &linked_project).await?;
-
-    let limit = if limit > 1000 {
-        eprintln!("Warning: limit cannot exceed 1000, using 1000 instead");
-        1000
-    } else if limit < 1 {
-        eprintln!("Warning: limit must be at least 1, using 1 instead");
-        1
-    } else {
-        limit
-    };
-
-    let project = get_project(&client, &configs, linked_project.project.clone()).await?;
-    let environment = environment.unwrap_or(linked_project.environment.clone());
-    let environment_id = get_matched_environment(&project, environment)?.id;
-
-    let service_id = if let Some(service_name_or_id) = service {
-        let service = project
-            .services
-            .edges
-            .iter()
-            .find(|s| {
-                s.node.name.to_lowercase() == service_name_or_id.to_lowercase()
-                    || s.node.id == service_name_or_id
-            })
-            .ok_or_else(|| anyhow::anyhow!("Service '{}' not found", service_name_or_id))?;
-        service.node.id.clone()
-    } else if let Some(linked_service_id) = linked_project.service {
-        linked_service_id
-    } else {
-        bail!(
-            "No service specified and no service linked. Use 'railway link' to link a service or specify one with the service argument."
-        );
-    };
+    let ctx = resolve_service_context(project, service, environment).await?;
+    let client = ctx.client;
+    let configs = ctx.configs;
+    let project_id = ctx.project_id;
+    let environment_id = ctx.environment_id;
+    let service_id = ctx.service_id;
 
     let variables = Variables {
         input: crate::gql::queries::deployments::DeploymentListInput {
             service_id: Some(service_id.clone()),
             environment_id: Some(environment_id),
-            project_id: None,
+            project_id: Some(project_id),
             status: None,
             include_deleted: None,
         },
@@ -160,41 +137,42 @@ async fn list_deployments(
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        if deployments.is_empty() {
-            println!("No deployments found");
-            return Ok(());
-        }
+        return Ok(());
+    }
 
-        println!("{}", "Recent Deployments".bold());
+    if deployments.is_empty() {
+        println!("No deployments found");
+        return Ok(());
+    }
 
-        for deployment in deployments {
-            let status_colored = match deployment.status {
-                DeploymentStatus::SUCCESS => format!("{:?}", deployment.status).green(),
-                DeploymentStatus::FAILED | DeploymentStatus::CRASHED => {
-                    format!("{:?}", deployment.status).red()
-                }
-                DeploymentStatus::BUILDING
-                | DeploymentStatus::DEPLOYING
-                | DeploymentStatus::INITIALIZING
-                | DeploymentStatus::WAITING
-                | DeploymentStatus::QUEUED => format!("{:?}", deployment.status).blue(),
-                DeploymentStatus::REMOVED | DeploymentStatus::REMOVING => {
-                    format!("{:?}", deployment.status).dimmed()
-                }
-                _ => format!("{:?}", deployment.status).white(),
-            };
+    println!("{}", "Recent Deployments".bold());
 
-            // Convert UTC time to local timezone
-            let local_time: DateTime<Local> = DateTime::from(deployment.created_at);
-            let created_at = local_time.format("%Y-%m-%d %H:%M:%S %Z");
-            println!(
-                "  {} | {} | {}",
-                deployment.id,
-                status_colored,
-                created_at.to_string().dimmed()
-            );
-        }
+    for deployment in deployments {
+        let status_colored = match deployment.status {
+            DeploymentStatus::SUCCESS => format!("{:?}", deployment.status).green(),
+            DeploymentStatus::FAILED | DeploymentStatus::CRASHED => {
+                format!("{:?}", deployment.status).red()
+            }
+            DeploymentStatus::BUILDING
+            | DeploymentStatus::DEPLOYING
+            | DeploymentStatus::INITIALIZING
+            | DeploymentStatus::WAITING
+            | DeploymentStatus::QUEUED => format!("{:?}", deployment.status).blue(),
+            DeploymentStatus::REMOVED | DeploymentStatus::REMOVING => {
+                format!("{:?}", deployment.status).dimmed()
+            }
+            _ => format!("{:?}", deployment.status).white(),
+        };
+
+        // Convert UTC time to local timezone
+        let local_time: DateTime<Local> = DateTime::from(deployment.created_at);
+        let created_at = local_time.format("%Y-%m-%d %H:%M:%S %Z");
+        println!(
+            "  {} | {} | {}",
+            deployment.id,
+            status_colored,
+            created_at.to_string().dimmed()
+        );
     }
 
     Ok(())

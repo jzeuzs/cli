@@ -3,19 +3,16 @@ mod docker_logs;
 mod log_store;
 mod ui;
 
-pub use app::ServiceInfo;
+pub use app::{RestartRequest, ServiceInfo, TuiAction};
 pub use docker_logs::{ServiceMapping, spawn_docker_logs};
 
 use std::io::stdout;
 use std::panic;
-use std::time::Duration;
 
 use anyhow::Result;
 use app::TuiApp;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
-};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,27 +26,30 @@ use super::LogLine;
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, Hide)?;
-    execute!(stdout(), EnableMouseCapture)?;
-
+    // Raw mode plus the alternate screen means stderr writes land wherever
+    // the cursor is and stay there until a full repaint, and an inquire
+    // prompt can never complete. The flag makes `reporter::warn` hold its
+    // tongue and every prompt helper fail fast for as long as this screen
+    // is up.
+    crate::util::prompt::set_terminal_owned(true);
+    execute!(stdout(), EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout());
-    let terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
     Ok(terminal)
 }
 
 fn restore_terminal() {
-    let _ = execute!(stdout(), DisableMouseCapture);
-    let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
     let _ = disable_raw_mode();
-    // Ensure cursor starts at column 0 on a fresh line
-    print!("\r\n");
-    let _ = std::io::Write::flush(&mut stdout());
+    crate::util::prompt::set_terminal_owned(false);
 }
 
 pub async fn run(
     mut log_rx: mpsc::Receiver<LogLine>,
     mut docker_rx: mpsc::Receiver<LogLine>,
     services: Vec<ServiceInfo>,
+    restart_tx: Option<mpsc::Sender<RestartRequest>>,
 ) -> Result<()> {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -66,7 +66,11 @@ pub async fn run(
     let mut app = TuiApp::new(services);
     let mut events = EventStream::new();
 
-    loop {
+    'main: loop {
+        if app.needs_clear {
+            terminal.clear()?;
+            app.needs_clear = false;
+        }
         terminal.draw(|f| ui::render(&mut app, f))?;
 
         tokio::select! {
@@ -77,16 +81,14 @@ pub async fn run(
                 app.push_log(log, true);
             }
             Some(Ok(event)) = events.next() => {
-                if process_event(&mut app, event) {
-                    break;
-                }
-                // Drain any queued events to batch scroll and prevent momentum lag
-                while let Ok(Some(Ok(event))) =
-                    tokio::time::timeout(Duration::from_millis(1), events.next()).await
-                {
-                    if process_event(&mut app, event) {
-                        break;
+                match process_event(&mut app, &mut terminal, event) {
+                    TuiAction::Quit => break 'main,
+                    TuiAction::Restart(req) => {
+                        if let Some(tx) = &restart_tx {
+                            let _ = tx.send(req).await;
+                        }
                     }
+                    TuiAction::None => {}
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -98,20 +100,25 @@ pub async fn run(
     Ok(())
 }
 
-fn process_event(app: &mut TuiApp, event: Event) -> bool {
+fn process_event(
+    app: &mut TuiApp,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    event: Event,
+) -> TuiAction {
     match event {
         Event::Key(key) => {
-            if app.handle_key(key) {
-                return true;
-            }
+            let (action, _tab_changed) = app.handle_key(key);
+            action
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                app.handle_mouse(mouse);
-            }
-            _ => {}
-        },
-        _ => {}
+        Event::Mouse(mouse) => {
+            app.handle_mouse(mouse);
+            TuiAction::None
+        }
+        Event::Resize(_, _) => {
+            // Force full redraw on resize to prevent artifacts
+            let _ = terminal.clear();
+            TuiAction::None
+        }
+        _ => TuiAction::None,
     }
-    false
 }

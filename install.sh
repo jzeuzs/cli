@@ -15,12 +15,28 @@ help_text="Options
 
    -b, --bin-dir
    Override the bin installation directory
+   Precedence: --bin-dir > RAILWAY_BIN_DIR > \$RAILWAY_HOME/bin > ~/.railway/bin
 
    -a, --arch
    Override the architecture identified by the installer
 
    -B, --base-url
    Override the base URL used for downloading releases
+
+   --agents
+   Install or reuse the Railway CLI, then configure Railway agent support.
+   On supported CLI versions this defaults to the remote MCP server via
+   \`railway mcp proxy\` (CLI login auth).
+
+   --remote
+   When used with --agents, configure the remote MCP server at
+   mcp.railway.com via the CLI proxy (uses \`railway login\`). Compatibility
+   alias of the default on current CLIs; also forces proxy on older CLIs
+   that still default \`setup agent -y\` to local MCP.
+
+   --local
+   When used with --agents, configure the local GraphQL-backed MCP server
+   (\`railway mcp\`) instead of the remote CLI proxy default.
 
    -r, --remove
    Uninstall railway
@@ -34,6 +50,7 @@ set -eu
 printf '\n'
 
 BOLD="$(tput bold 2>/dev/null || printf '')"
+DIM="$(tput dim 2>/dev/null || printf '')"
 GREY="$(tput setaf 0 2>/dev/null || printf '')"
 UNDERLINE="$(tput smul 2>/dev/null || printf '')"
 RED="$(tput setaf 1 2>/dev/null || printf '')"
@@ -78,8 +95,10 @@ has() {
 
 RANDOM_FOR_SH=$(od -vAn -N4 -tu4 < /dev/urandom | sed 's/\t*$//g')
 
-# Removes leading whitespace
-RANDOM_FOR_SH=$(echo ${RANDOM_FOR_SH:-$RANDOM})
+# Removes leading whitespace. The fallback is $$ rather than $RANDOM: this
+# script runs under dash and busybox ash (via `curl … | sh`), where $RANDOM is
+# unset and `set -u` would abort with "RANDOM: parameter not set".
+RANDOM_FOR_SH=$(echo ${RANDOM_FOR_SH:-$$})
 
 # Gets path to a temporary file, even if
 get_tmpfile() {
@@ -104,6 +123,106 @@ test_writeable() {
   else
     return 1
   fi
+}
+
+default_railway_home() {
+  if [ -n "${RAILWAY_HOME-}" ]; then
+    printf '%s' "${RAILWAY_HOME}"
+    return 0
+  fi
+
+  if [ -n "${HOME-}" ]; then
+    printf '%s' "${HOME}/.railway"
+    return 0
+  fi
+
+  return 1
+}
+
+tildify() {
+  if [ -n "${HOME-}" ]; then
+    case "$1" in
+      "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+      "$HOME") printf '~' ;;
+      *) printf '%s' "$1" ;;
+    esac
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# POSIX stand-in for bash's ${var//needle/repl}. This script is reached via
+# `curl … | sh` on systems where /bin/sh is dash (Debian/Ubuntu) or busybox ash
+# (Alpine), neither of which supports pattern-substitution expansion.
+replace_all() {
+  local str="$1"
+  local needle="$2"
+  local repl="$3"
+  local out=""
+  local head
+
+  # An empty needle matches at every position, so the loop below would never
+  # advance. No caller does this today; guard anyway rather than let a future one
+  # hang the installer with no output.
+  if [ -z "$needle" ]; then
+    printf '%s' "$str"
+    return 0
+  fi
+
+  # Assign the prefix on its own line: `"${str%%"$needle"*}"` nested inside an
+  # outer double-quoted string is left unspecified by POSIX, and this script
+  # runs under whatever /bin/sh the host provides.
+  while :; do
+    case "$str" in
+      *"$needle"*)
+        head=${str%%"$needle"*}
+        out=$out$head$repl
+        str=${str#*"$needle"}
+        ;;
+      *) break ;;
+    esac
+  done
+
+  printf '%s%s' "$out" "$str"
+}
+
+shell_quote() {
+  printf "'%s'" "$(replace_all "$1" "'" "'\\''")"
+}
+
+fish_quote() {
+  local value
+  value="$(replace_all "$1" '\' '\\')"
+  value="$(replace_all "$value" "'" "\\'")"
+  printf "'%s'" "$value"
+}
+
+source_path() {
+  local path="$1"
+
+  if [ -n "${HOME-}" ]; then
+    case "$path" in
+      "$HOME"/*) printf '"$HOME/%s"' "${path#"$HOME"/}"; return ;;
+    esac
+  fi
+
+  shell_quote "$path"
+}
+
+fish_source_path() {
+  local path="$1"
+
+  if [ -n "${HOME-}" ]; then
+    case "$path" in
+      "$HOME"/*) printf '"$HOME/%s"' "${path#"$HOME"/}"; return ;;
+    esac
+  fi
+
+  fish_quote "$path"
+}
+
+bin_dir_uses_railway_home() {
+  [ -n "${RAILWAY_HOME_DIR-}" ] && [ "${BIN_DIR%/}" = "${RAILWAY_HOME_DIR%/}/bin" ]
 }
 
 download() {
@@ -140,8 +259,12 @@ unpack() {
 
   case "$archive" in
     *.tar.gz)
-      flags=$(test -n)
-      ${sudo} tar "${flags}" -xzf "${archive}" -C "${bin_dir}"
+      # VERBOSE is normalized to "v" or "" during option parsing. Fold it into
+      # the flag bundle rather than passing a separate "${flags}" word: when
+      # empty that expands to an empty argument, which GNU tar ignores but
+      # busybox tar (Alpine) reads as a member name -> "tar: : not found in
+      # archive".
+      ${sudo} tar "-${VERBOSE}xzf" "${archive}" -C "${bin_dir}"
       return 0
       ;;
     *.zip)
@@ -285,26 +408,10 @@ confirm() {
 check_bin_dir() {
   local bin_dir="$1"
 
-  if [ ! -d "$BIN_DIR" ]; then
-    error "Installation location $BIN_DIR does not appear to be a directory"
+  if [ ! -d "$bin_dir" ]; then
+    error "Installation location $bin_dir does not appear to be a directory"
     info "Make sure the location exists and is a directory, then try again."
     exit 1
-  fi
-
-  # https://stackoverflow.com/a/11655875
-  local good
-  good=$(
-    IFS=:
-    for path in $PATH; do
-      if [ "${path}" = "${bin_dir}" ]; then
-        printf 1
-        break
-      fi
-    done
-  )
-
-  if [ "${good}" != "1" ]; then
-    warn "Bin directory ${bin_dir} is not in your \$PATH"
   fi
 }
 
@@ -337,26 +444,67 @@ is_build_available() {
 }
 UNINSTALL=0
 HELP=0
+AGENTS=0
+REMOTE=0
+LOCAL=0
+RAILWAY_HOME_DIR=""
+RAILWAY_ENV_FILE=""
+RAILWAY_FISH_ENV_FILE=""
+PATH_ACTIVATION_PRINTED=0
+RAILWAY_PATH_MARKER_BEGIN="# >>> railway initialize >>>"
+RAILWAY_PATH_MARKER_END="# <<< railway initialize <<<"
+SHELL_STARTUP_FILE=""
+SHELL_STARTUP_ACTION=""
 
-DEFAULT_VERSION=$(curl -s https://api.github.com/repos/railwayapp/cli/releases/latest | grep -o '"tag_name": "v.*"' | cut -d'"' -f4 | cut -c2-)
+# Resolve the version to install. Deliberately lazy: called only after --help and
+# --remove have had their chance to exit, and skipped outright when the caller
+# pinned RAILWAY_VERSION. Use GitHub's latest-release redirect instead of the
+# REST API, whose unauthenticated quota is shared by every client on a public IP.
+# Resolving eagerly also broke pinned installs, --help and --remove. (#1030)
+resolve_railway_version() {
+  local latest_url
 
-if [ -z "$DEFAULT_VERSION" ]; then
-  error "Failed to fetch latest version from GitHub"
-  exit 1
-fi
+  if [ -n "${RAILWAY_VERSION-}" ]; then
+    return 0
+  fi
+
+  latest_url=$(curl --fail --silent --show-error --head --location \
+    --connect-timeout 5 --max-time 15 --output /dev/null \
+    --write-out '%{url_effective}' \
+    https://github.com/railwayapp/cli/releases/latest) || latest_url=""
+
+  # Accept only a release tag from this repository, not a login/error page or
+  # the unresolved /latest URL. A failed request must not supply a version.
+  RAILWAY_VERSION=$(printf '%s\n' "$latest_url" \
+    | sed -n 's|^https://github.com/railwayapp/cli/releases/tag/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p')
+
+  if [ -z "$RAILWAY_VERSION" ]; then
+    error "Could not determine the latest Railway CLI version from GitHub."
+    info "Check that https://github.com/railwayapp/cli/releases/latest is reachable."
+    info "Retry, or pin a known version to skip this lookup entirely:"
+    info "  ${BOLD}RAILWAY_VERSION=<x.y.z>${NO_COLOR}"
+    exit 1
+  fi
+}
 
 
 # defaults
-if [ -z "${RAILWAY_VERSION-}" ]; then
-  RAILWAY_VERSION="$DEFAULT_VERSION"
-fi
-
 if [ -z "${RAILWAY_PLATFORM-}" ]; then
   PLATFORM="$(detect_platform)"
 fi
 
-if [ -z "${RAILWAY_BIN_DIR-}" ]; then
-  BIN_DIR=/usr/local/bin
+if RAILWAY_HOME_DIR="$(default_railway_home)"; then
+  if [ -n "${RAILWAY_BIN_DIR-}" ]; then
+    BIN_DIR="${RAILWAY_BIN_DIR}"
+  else
+    BIN_DIR="${RAILWAY_HOME_DIR%/}/bin"
+  fi
+else
+  if [ -n "${RAILWAY_BIN_DIR-}" ]; then
+    BIN_DIR="${RAILWAY_BIN_DIR}"
+  else
+    BIN_DIR=""
+  fi
 fi
 
 if [ -z "${RAILWAY_ARCH-}" ]; then
@@ -397,6 +545,18 @@ while [ "$#" -gt 0 ]; do
     ;;
   -r | --remove | --uninstall)
     UNINSTALL=1
+    shift 1
+    ;;
+  --agents)
+    AGENTS=1
+    shift 1
+    ;;
+  --remote)
+    REMOTE=1
+    shift 1
+    ;;
+  --local)
+    LOCAL=1
     shift 1
     ;;
   -h | --help)
@@ -442,26 +602,537 @@ else
   VERBOSE=
 fi
 
+# --remote / --local only take effect alongside --agents. Warn loudly rather
+# than silently no-op.
+if [ "$REMOTE" = 1 ] && [ "$AGENTS" != 1 ]; then
+  warn "--remote has no effect without --agents. Re-run with both flags to configure remote MCP."
+fi
+if [ "$LOCAL" = 1 ] && [ "$AGENTS" != 1 ]; then
+  warn "--local has no effect without --agents. Re-run with both flags to configure local MCP."
+fi
+if [ "$REMOTE" = 1 ] && [ "$LOCAL" = 1 ]; then
+  error "--remote and --local cannot be used together."
+  exit 1
+fi
+
+write_env_files() {
+  local quoted_railway_home
+  local fish_railway_home
+
+  if ! bin_dir_uses_railway_home; then
+    return 0
+  fi
+
+  if ! mkdir -p "$RAILWAY_HOME_DIR"; then
+    warn "Could not create $(tildify "$RAILWAY_HOME_DIR"); skipping activation file."
+    return 0
+  fi
+
+  RAILWAY_ENV_FILE="$RAILWAY_HOME_DIR/env"
+  RAILWAY_FISH_ENV_FILE="$RAILWAY_HOME_DIR/env.fish"
+
+  if [ -e "$RAILWAY_ENV_FILE" ] && { [ ! -f "$RAILWAY_ENV_FILE" ] || [ ! -w "$RAILWAY_ENV_FILE" ]; }; then
+    warn "Could not write $(tildify "$RAILWAY_ENV_FILE"); skipping activation file."
+    RAILWAY_ENV_FILE=""
+    RAILWAY_FISH_ENV_FILE=""
+    return 0
+  fi
+
+  quoted_railway_home="$(shell_quote "$RAILWAY_HOME_DIR")"
+  fish_railway_home="$(fish_quote "$RAILWAY_HOME_DIR")"
+
+  if ! {
+    printf 'export RAILWAY_HOME=%s\n' "$quoted_railway_home"
+    printf 'case ":$PATH:" in\n'
+    printf '  *":$RAILWAY_HOME/bin:"*) ;;\n'
+    printf '  *) export PATH="$RAILWAY_HOME/bin:$PATH" ;;\n'
+    printf 'esac\n'
+  } > "$RAILWAY_ENV_FILE"; then
+    warn "Could not write $(tildify "$RAILWAY_ENV_FILE"); skipping activation file."
+    RAILWAY_ENV_FILE=""
+    RAILWAY_FISH_ENV_FILE=""
+    return 0
+  fi
+
+  if [ -e "$RAILWAY_FISH_ENV_FILE" ] && { [ ! -f "$RAILWAY_FISH_ENV_FILE" ] || [ ! -w "$RAILWAY_FISH_ENV_FILE" ]; }; then
+    warn "Could not write $(tildify "$RAILWAY_FISH_ENV_FILE"); fish users may need to add $(tildify "$BIN_DIR") to PATH manually."
+    RAILWAY_FISH_ENV_FILE=""
+    return 0
+  fi
+
+  if ! {
+    printf 'set -gx RAILWAY_HOME %s\n' "$fish_railway_home"
+    printf 'if not contains "$RAILWAY_HOME/bin" $PATH\n'
+    printf '  set -gx PATH "$RAILWAY_HOME/bin" $PATH\n'
+    printf 'end\n'
+  } > "$RAILWAY_FISH_ENV_FILE"; then
+    warn "Could not write $(tildify "$RAILWAY_FISH_ENV_FILE"); fish users may need to add $(tildify "$BIN_DIR") to PATH manually."
+    RAILWAY_FISH_ENV_FILE=""
+  fi
+}
+
+print_path_commands() {
+  local commands="$1"
+  local command
+
+  printf '%s\n' "$commands" | while IFS= read -r command; do
+    printf '  %s\n' "$command"
+  done
+}
+
+activation_command() {
+  local shell_name=""
+  local env_file="$RAILWAY_ENV_FILE"
+
+  if [ -n "${SHELL-}" ]; then
+    shell_name="$(basename "$SHELL")"
+  fi
+
+  if [ "$shell_name" = "fish" ]; then
+    if [ -n "$RAILWAY_FISH_ENV_FILE" ]; then
+      env_file="$RAILWAY_FISH_ENV_FILE"
+    else
+      return 1
+    fi
+
+    printf 'source %s' "$(fish_source_path "$env_file")"
+    return 0
+  fi
+
+  if [ -n "$env_file" ]; then
+    printf 'source %s' "$(source_path "$env_file")"
+    return 0
+  fi
+
+  return 1
+}
+
+configure_shell_startup() {
+  local contents="$1"
+  local shell_name=""
+  local rc_file=""
+  local rc_dir
+  local tmp_file
+
+  SHELL_STARTUP_FILE=""
+  SHELL_STARTUP_ACTION=""
+
+  if [ -z "${HOME-}" ]; then
+    return 1
+  fi
+
+  if [ -n "${SHELL-}" ]; then
+    shell_name="$(basename "$SHELL")"
+  fi
+
+  case "$shell_name" in
+    fish)
+      rc_file="$HOME/.config/fish/config.fish"
+      ;;
+    zsh)
+      rc_file="$HOME/.zshrc"
+      ;;
+    bash)
+      if [ -f "$HOME/.bash_profile" ]; then
+        rc_file="$HOME/.bash_profile"
+      else
+        rc_file="$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  if [ -e "$rc_file" ] && { [ ! -f "$rc_file" ] || [ ! -w "$rc_file" ]; }; then
+    warn "Could not update $(tildify "$rc_file"); add $(tildify "$BIN_DIR") to PATH manually."
+    return 1
+  fi
+
+  rc_dir="$(dirname "$rc_file")"
+  if ! mkdir -p "$rc_dir"; then
+    warn "Could not create $(tildify "$rc_dir"); add $(tildify "$BIN_DIR") to PATH manually."
+    return 1
+  fi
+
+  if [ -f "$rc_file" ]; then
+    if grep -qF "$RAILWAY_PATH_MARKER_BEGIN" "$rc_file"; then
+      SHELL_STARTUP_ACTION="Updated"
+    else
+      SHELL_STARTUP_ACTION="Added"
+    fi
+  else
+    SHELL_STARTUP_ACTION="Created"
+  fi
+
+  tmp_file="$(get_tmpfile shell)"
+  if [ -f "$rc_file" ]; then
+    if ! awk -v begin="$RAILWAY_PATH_MARKER_BEGIN" -v end="$RAILWAY_PATH_MARKER_END" '
+      $0 == begin { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$rc_file" > "$tmp_file"; then
+      rm -f "$tmp_file"
+      warn "Could not update $(tildify "$rc_file"); add $(tildify "$BIN_DIR") to PATH manually."
+      return 1
+    fi
+  else
+    : > "$tmp_file"
+  fi
+
+  {
+    printf '\n%s\n' "$RAILWAY_PATH_MARKER_BEGIN"
+    printf '%s\n' "$contents"
+    printf '%s\n' "$RAILWAY_PATH_MARKER_END"
+  } >> "$tmp_file"
+
+  if [ -f "$rc_file" ]; then
+    if ! cat "$tmp_file" > "$rc_file"; then
+      rm -f "$tmp_file"
+      warn "Could not update $(tildify "$rc_file"); add $(tildify "$BIN_DIR") to PATH manually."
+      return 1
+    fi
+    rm -f "$tmp_file"
+  elif ! mv "$tmp_file" "$rc_file"; then
+    rm -f "$tmp_file"
+    warn "Could not create $(tildify "$rc_file"); add $(tildify "$BIN_DIR") to PATH manually."
+    return 1
+  fi
+
+  SHELL_STARTUP_FILE="$rc_file"
+  return 0
+}
+
+configure_shell_path() {
+  local quiet="${1:-}"
+  local quoted_bin_dir
+  local quoted_railway_home
+  local fish_bin_dir
+  local fish_railway_home
+  local bash_line
+  local bash_contents
+  local fish_line
+  local fish_contents
+  local path_commands
+  local startup_contents
+  local activation
+  local shell_name
+
+  if bin_dir_uses_railway_home; then
+    quoted_railway_home="$(shell_quote "$RAILWAY_HOME_DIR")"
+    fish_railway_home="$(fish_quote "$RAILWAY_HOME_DIR")"
+    bash_line='export PATH="$RAILWAY_HOME/bin:$PATH"'
+    bash_contents="export RAILWAY_HOME=$quoted_railway_home
+$bash_line"
+    fish_line='set -gx PATH "$RAILWAY_HOME/bin" $PATH'
+    fish_contents="set -gx RAILWAY_HOME $fish_railway_home
+$fish_line"
+  else
+    quoted_bin_dir="$(shell_quote "$BIN_DIR")"
+    fish_bin_dir="$(fish_quote "$BIN_DIR")"
+    bash_line="export PATH=$quoted_bin_dir:\"\$PATH\""
+    bash_contents="$bash_line"
+    fish_line="set -gx PATH $fish_bin_dir \$PATH"
+    fish_contents="$fish_line"
+  fi
+
+  shell_name=""
+  if [ -n "${SHELL-}" ]; then
+    shell_name="$(basename "$SHELL")"
+  fi
+
+  path_commands="$bash_contents"
+  startup_contents="$bash_contents"
+  if [ "$shell_name" = "fish" ]; then
+    path_commands="$fish_contents"
+    startup_contents="$fish_contents"
+  fi
+
+  if activation="$(activation_command)"; then
+    path_commands="$activation"
+    startup_contents="$activation"
+  fi
+
+  # Agent flow: still write the startup file, but collapse to one clean line.
+  # The "source in this shell" reminder is deferred to the next-steps block, so
+  # leave PATH_ACTIVATION_PRINTED unset to signal next-steps should show it.
+  if [ -n "$quiet" ]; then
+    if configure_shell_startup "$startup_contents"; then
+      completed "Shell PATH — $(tildify "$SHELL_STARTUP_FILE") updated"
+    fi
+    RAILWAY_ACTIVATION_CMD="$path_commands"
+    return
+  fi
+
+  warn "Railway was installed to $(tildify "$BIN_DIR"), but this shell does not resolve 'railway' from there yet."
+  if configure_shell_startup "$startup_contents"; then
+    info "$SHELL_STARTUP_ACTION Railway PATH setup in $(tildify "$SHELL_STARTUP_FILE")"
+    info "New terminals will have railway available automatically."
+  else
+    info "To make railway available in new terminals, add this command to your shell startup file:"
+    print_path_commands "$startup_contents"
+  fi
+  info "To use railway in this terminal, run:"
+  print_path_commands "$path_commands"
+  PATH_ACTIVATION_PRINTED=1
+}
+
+installed_railway_is_on_path() {
+  local railway_on_path
+  local installed_bin
+
+  railway_on_path="$(command -v railway 2>/dev/null || true)"
+  installed_bin="${BIN_DIR%/}/railway"
+
+  [ -n "$railway_on_path" ] || return 1
+  [ "$railway_on_path" = "$installed_bin" ] && return 0
+  [ -e "$railway_on_path" ] && [ -e "$installed_bin" ] && [ "$railway_on_path" -ef "$installed_bin" ]
+}
+
+extract_railway_version() {
+  # Pull X.Y.Z (with optional pre-release suffix and leading v) out of
+  # `--version` output. Echoes empty string on failure so callers can
+  # treat missing versions as "skip upgrade check".
+  printf '%s' "$1" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?' | head -1 | sed 's/^v//'
+}
+
+version_lt() {
+  # Returns 0 (true) when $1 is older than $2 by major.minor.patch.
+  # Pre-release suffixes are stripped before comparison so "4.55.0"
+  # beats "4.55.0-rc.1". Returns 1 (false) for equal, newer, or
+  # unparseable inputs — i.e. errs on the side of NOT triggering an
+  # upgrade when we can't tell.
+  local a b a1 a2 a3 b1 b2 b3
+  if [ -z "${1-}" ] || [ -z "${2-}" ]; then return 1; fi
+  a="${1%%-*}"
+  b="${2%%-*}"
+  a1="$(printf '%s' "$a" | cut -d. -f1)"
+  a2="$(printf '%s' "$a" | cut -d. -f2)"
+  a3="$(printf '%s' "$a" | cut -d. -f3)"
+  b1="$(printf '%s' "$b" | cut -d. -f1)"
+  b2="$(printf '%s' "$b" | cut -d. -f2)"
+  b3="$(printf '%s' "$b" | cut -d. -f3)"
+  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+  case "$a1$a2$a3$b1$b2$b3" in *[!0-9]*) return 1 ;; esac
+  if [ "$a1" -lt "$b1" ]; then return 0; fi
+  if [ "$a1" -gt "$b1" ]; then return 1; fi
+  if [ "$a2" -lt "$b2" ]; then return 0; fi
+  if [ "$a2" -gt "$b2" ]; then return 1; fi
+  if [ "$a3" -lt "$b3" ]; then return 0; fi
+  return 1
+}
+
+find_railway_bins() {
+  local seen=":"
+  local dir bin
+  local old_ifs="$IFS"
+
+  IFS=':'
+  set -- $PATH
+  IFS="$old_ifs"
+
+  for dir do
+    [ -n "$dir" ] || continue
+    bin="$dir/railway"
+    [ -x "$bin" ] || continue
+    case "$seen" in
+      *":$bin:"*) ;;
+      *)
+        printf '%s\n' "$bin"
+        seen="$seen$bin:"
+        ;;
+    esac
+  done
+}
+
+print_cli_conflicts() {
+  # In quiet mode (the agent setup flow) we only surface an actual conflict;
+  # the informational "on PATH" listing is noise when there's a single install.
+  local quiet="${1:-}"
+  local bins_file
+  local bin version
+  local count=0
+
+  bins_file="$(get_tmpfile bins)"
+  find_railway_bins > "$bins_file"
+
+  if [ ! -s "$bins_file" ]; then
+    rm -f "$bins_file"
+    return
+  fi
+
+  [ -z "$quiet" ] && info "Railway CLI on PATH:"
+  while IFS= read -r bin; do
+    count=$((count + 1))
+    version="$("$bin" --version 2>/dev/null || echo unknown)"
+    [ -z "$quiet" ] && info "  $bin ($version)"
+  done < "$bins_file"
+  rm -f "$bins_file"
+  [ -z "$quiet" ] && info "Shells use the first entry above."
+
+  if [ "$count" -gt 1 ]; then
+    warn "Multiple Railway CLI installs found. No PATH entries were reordered or removed."
+  fi
+}
+
+warn_existing_path_conflict() {
+  local railway_on_path
+  local installed_bin
+
+  railway_on_path="$(command -v railway 2>/dev/null || true)"
+  installed_bin="${BIN_DIR%/}/railway"
+
+  [ -n "$railway_on_path" ] || return 0
+  [ -x "$installed_bin" ] || return 0
+
+  if installed_railway_is_on_path; then
+    return 0
+  fi
+
+  warn "Another Railway CLI is already on PATH: $railway_on_path"
+  warn "After activation, shells will use $(tildify "$installed_bin") first."
+}
+
+run_agent_setup() {
+  local railway_bin="$1"
+  local yes=""
+  local mcp_transport=""
+
+  if [ -z "${RAILWAY_INSTALL_REQUEST_ID-}" ]; then
+    RAILWAY_INSTALL_REQUEST_ID="install_$(od -vAn -N16 -tx1 < /dev/urandom | tr -d ' \n')"
+    export RAILWAY_INSTALL_REQUEST_ID
+  fi
+
+  if [ -n "${FORCE-}" ] || [ ! -t 0 ]; then
+    yes="-y"
+  fi
+
+  # Transport selection for `setup agent`:
+  # - `--local` opts into the in-process server.
+  # - `--remote` forces the CLI proxy (alias of the current default).
+  # - Non-interactive agents setup also passes `--remote` when the binary
+  #   supports it, so older CLIs that still default `-y` to local MCP land on
+  #   the proxy. Probe `--help` first: pre-proxy binaries must not die on an
+  #   unrecognized flag when we continue with a managed/Homebrew install.
+  if [ "$LOCAL" = 1 ]; then
+    mcp_transport="--local"
+  elif [ "$REMOTE" = 1 ]; then
+    mcp_transport="--remote"
+  elif [ -n "$yes" ]; then
+    if "$railway_bin" setup agent --help 2>&1 | grep -q -- '--remote'; then
+      mcp_transport="--remote"
+    fi
+  fi
+
+  if [ -t 0 ] && [ -z "${FORCE-}" ]; then
+    if "$railway_bin" whoami >/dev/null 2>&1; then
+      info "Already logged in to Railway."
+    else
+      info "Logging in to Railway (opens a browser)..."
+      "$railway_bin" login
+    fi
+  fi
+
+  # Tell `setup agent` it's running inside the installer so it renders its
+  # skills/MCP steps as part of one unified flow (no duplicate header, footer,
+  # login prompt, or restart notices — the installer prints those once below).
+  # Never let this abort the installer bare under `set -e`. The CLI itself is
+  # installed and working by this point, so a failure here must say which half
+  # broke, surface the real status, and still point somewhere useful — the old
+  # behaviour was to die mid-script with no Railway-branded message at all.
+  AGENT_SETUP_RC=0
+  RAILWAY_SETUP_EMBEDDED=1 "$railway_bin" setup agent $yes $mcp_transport || AGENT_SETUP_RC=$?
+  if [ "$AGENT_SETUP_RC" -ne 0 ]; then
+    printf "\n"
+    if [ "$AGENT_SETUP_RC" -eq 2 ]; then
+      error "This Railway CLI (${CURRENT_VERSION:-unknown}) does not support 'setup agent'."
+      error "Upgrade it first, then re-run: curl -fsSL railway.com/agents.sh | sh"
+    elif [ "$AGENT_SETUP_RC" -gt 128 ]; then
+      error "Agent setup terminated by signal $((AGENT_SETUP_RC - 128)): $railway_bin setup agent"
+      error "Please report this at https://github.com/railwayapp/cli/issues/new"
+    else
+      error "Agent setup failed (exit $AGENT_SETUP_RC): $railway_bin setup agent"
+    fi
+    info "The Railway CLI itself is installed and usable: $(tildify "$railway_bin")"
+    info "Re-run 'railway setup agent' once the above is resolved."
+    exit "$AGENT_SETUP_RC"
+  fi
+
+  # Record login state (and the "Logged in as …" line) for the next-steps
+  # block; don't warn here. whoami exits non-zero and prints nothing when
+  # unauthenticated — the `|| true` matters under `set -e`: without it, this
+  # assignment itself aborts the whole script for the (extremely common)
+  # not-logged-in-yet case, and print_agent_next_steps() below never runs.
+  AGENT_WHOAMI="$("$railway_bin" whoami 2>/dev/null || true)"
+  if [ -n "$AGENT_WHOAMI" ]; then
+    AGENT_LOGGED_IN=1
+  else
+    AGENT_LOGGED_IN=0
+  fi
+}
+
+# Section 2 of the agent setup flow: a visually distinct "completion +
+# verification" block, separated from the installation steps by a rule.
+print_agent_next_steps() {
+  local rule="────────────────────────────────────────────"
+  printf '\n%s\n\n' "$rule"
+  printf '%s %s\n' "${GREEN}✓${NO_COLOR}" "${BOLD}Setup complete${NO_COLOR}"
+
+  printf '\n%s\n' "${BOLD}Next steps${NO_COLOR}"
+
+  # 1. Account — green check when already authenticated, otherwise the action.
+  if [ "${AGENT_LOGGED_IN:-0}" = "1" ]; then
+    printf '  1  %s\n' "${GREEN}✓ ${AGENT_WHOAMI:-Logged in to Railway}${NO_COLOR}"
+  else
+    printf '  1  Run %s to connect your Railway account\n' "${BOLD}railway login${NO_COLOR}"
+  fi
+
+  # 2. Shell PATH — green check when railway already resolves, otherwise activate.
+  if [ -n "${RAILWAY_ACTIVATION_CMD:-}" ]; then
+    printf '  2  Run %s to use railway in this shell\n' "${BOLD}${RAILWAY_ACTIVATION_CMD}${NO_COLOR}"
+  else
+    printf '  2  %s\n' "${GREEN}✓ railway is on your PATH${NO_COLOR}"
+  fi
+
+  # 3. Kick the tires — guide the user (or agent) into actually using it.
+  printf '  3  %s\n' "Run your agent (Claude Code, Codex, OpenCode, etc.) and ask it to ${BOLD}'Show the status of your projects'${NO_COLOR} or ${BOLD}'Deploy this application'${NO_COLOR}"
+
+  printf '\n%s\n' "${DIM}Note: if running in an agent session, you may need to restart the agent to access the new Skills or MCP resources.${NO_COLOR}"
+
+  printf '\n%s\n\n' "Docs · ${UNDERLINE}https://docs.railway.com/agents${NO_COLOR}"
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   confirm "Are you sure you want to uninstall railway?"
 
   msg=""
   sudo=""
+  railway_bin="$(command -v railway 2>/dev/null || true)"
+
+  if [ -z "$railway_bin" ] && [ -x "$BIN_DIR/railway" ]; then
+    railway_bin="$BIN_DIR/railway"
+  fi
+
+  if [ -z "$railway_bin" ]; then
+    error "Could not find railway on PATH or at $BIN_DIR/railway"
+    exit 1
+  fi
 
   info "REMOVING railway"
 
-  if test_writeable "$(dirname "$(which railway)")"; then
+  if test_writeable "$(dirname "$railway_bin")"; then
     sudo=""
     msg="Removing railway, please wait…"
   else
-    warn "Escalated permissions are required to install to ${BIN_DIR}"
+    warn "Escalated permissions are required to remove ${railway_bin}"
     elevate_priv
     sudo="sudo"
     msg="Removing railway as root, please wait…"
   fi
 
   info "$msg"
-  ${sudo} rm "$(which railway)"
+  ${sudo} rm "$railway_bin"
   ${sudo} rm -f /tmp/railway 2>/dev/null || true
 
   info "Removed railway"
@@ -472,6 +1143,163 @@ if [ "$HELP" = 1 ]; then
     echo "${help_text}"
     exit 0
 fi
+
+# Everything past this point needs a concrete version; --help and --remove are
+# already done, so this is the first place the lookup can be required.
+resolve_railway_version
+
+RAILWAY_UPGRADE_AGENT=0
+
+if [ "$AGENTS" = 1 ] && has railway; then
+  RAILWAY_BIN="$(command -v railway)"
+  RAW_VERSION="$("$RAILWAY_BIN" --version 2>/dev/null || true)"
+  CURRENT_VERSION="$(extract_railway_version "$RAW_VERSION")"
+
+  info "Railway CLI already installed: $RAILWAY_BIN (${CURRENT_VERSION:-unknown})"
+  print_cli_conflicts
+
+  NEEDS_UPGRADE=0
+  if [ -n "$CURRENT_VERSION" ] && version_lt "$CURRENT_VERSION" "$RAILWAY_VERSION"; then
+    NEEDS_UPGRADE=1
+  fi
+
+  if [ "$NEEDS_UPGRADE" = 0 ]; then
+    info "No PATH changes were made."
+    run_agent_setup "$RAILWAY_BIN"
+    exit 0
+  fi
+
+  # Refuse to self-upgrade inside a Railway Sandbox. The sandbox's own
+  # exec/SSH bridge is served by the resident `railway` process, so
+  # replacing that binary in place isn't possible there (extracting or
+  # renaming a new binary over it fails, with no user-facing workaround).
+  # The sandbox's pre-installed CLI is managed by Railway, so continue
+  # with it instead of attempting an upgrade that cannot succeed.
+  if [ -n "${RAILWAY_SANDBOX_ID-}" ]; then
+    info "Running inside a Railway Sandbox — the pre-installed CLI is managed by Railway."
+    info "Continuing with $CURRENT_VERSION."
+    run_agent_setup "$RAILWAY_BIN"
+    exit 0
+  fi
+
+  # Refuse to clobber package-manager-owned binaries; route the user
+  # through the right channel and continue with the existing CLI so the
+  # agent setup still runs. Catches both M-series (/opt/homebrew/*) and
+  # Intel (/usr/local/Cellar/*) direct paths plus the /usr/local/bin
+  # symlink Intel Homebrew creates.
+  BREW_INSTALL=0
+  case "$RAILWAY_BIN" in
+    /opt/homebrew/*|/usr/local/Cellar/*) BREW_INSTALL=1 ;;
+    /usr/local/bin/railway)
+      if [ -L "$RAILWAY_BIN" ]; then
+        case "$(readlink "$RAILWAY_BIN" 2>/dev/null || true)" in
+          *Cellar*|*homebrew*) BREW_INSTALL=1 ;;
+        esac
+      fi
+      ;;
+  esac
+
+  if [ "$BREW_INSTALL" = 1 ]; then
+    if [ "$REMOTE" = 1 ] || [ "$LOCAL" = 1 ]; then
+      # Transport flags were added in newer releases. Continuing with an older
+      # brewed CLI would call `setup agent --remote/--local` and fail with an
+      # unrecognized-arg error after we already told the user we were continuing.
+      # Refuse early.
+      flag_name="--remote"
+      if [ "$LOCAL" = 1 ]; then
+        flag_name="--local"
+      fi
+      error "Railway CLI was installed via Homebrew (version $CURRENT_VERSION)."
+      error "The $flag_name flag requires Railway CLI $RAILWAY_VERSION or newer."
+      error "Run 'brew upgrade railway' first, then re-run cli.new --agents $flag_name."
+      exit 1
+    fi
+    warn "Railway CLI was installed via Homebrew."
+    warn "Run 'brew upgrade railway' to update from $CURRENT_VERSION to $RAILWAY_VERSION, then re-run cli.new --agents."
+    info "Continuing with $CURRENT_VERSION."
+    run_agent_setup "$RAILWAY_BIN"
+    exit 0
+  fi
+
+  # Same reasoning as the Homebrew branch above, for the JS package managers.
+  # Every release we publish is a native executable, so a `railway` on PATH that
+  # is a script or a link into node_modules belongs to something else: npm, yarn
+  # and bun symlink a .js entrypoint, pnpm writes a /bin/sh shim. Extracting into
+  # that bin dir replaces the tool's entry with a raw binary it still records as
+  # its own, so a later `npm uninstall -g @railway/cli` deletes the binary we
+  # just installed — leaving no railway at all — and reinstalling reverts it.
+  MANAGED_BIN=0
+  case "$RAILWAY_BIN" in
+    */node_modules/*) MANAGED_BIN=1 ;;
+  esac
+  if [ "$MANAGED_BIN" = 0 ] && [ -L "$RAILWAY_BIN" ]; then
+    case "$(readlink "$RAILWAY_BIN" 2>/dev/null || true)" in
+      */node_modules/*|*.js) MANAGED_BIN=1 ;;
+    esac
+  fi
+  # Catches pnpm's shell shim, and any hand-rolled wrapper — which we equally
+  # should not overwrite.
+  if [ "$MANAGED_BIN" = 0 ] && [ "$(head -c 2 "$RAILWAY_BIN" 2>/dev/null || true)" = '#!' ]; then
+    MANAGED_BIN=1
+  fi
+
+  if [ "$MANAGED_BIN" = 1 ]; then
+    if [ "$REMOTE" = 1 ] || [ "$LOCAL" = 1 ]; then
+      flag_name="--remote"
+      if [ "$LOCAL" = 1 ]; then
+        flag_name="--local"
+      fi
+      error "Railway CLI on PATH is managed by another tool: $RAILWAY_BIN ($CURRENT_VERSION)."
+      error "The $flag_name flag requires Railway CLI $RAILWAY_VERSION or newer."
+      error "Update it with that tool first (e.g. 'npm install -g @railway/cli@latest'), then re-run cli.new --agents $flag_name."
+      exit 1
+    fi
+    warn "Railway CLI on PATH is managed by another tool: $RAILWAY_BIN"
+    warn "Update it with that tool (e.g. 'npm install -g @railway/cli@latest') to go from $CURRENT_VERSION to $RAILWAY_VERSION, then re-run cli.new --agents."
+    info "Continuing with $CURRENT_VERSION."
+    run_agent_setup "$RAILWAY_BIN"
+    exit 0
+  fi
+
+  EXISTING_BIN_DIR="$(dirname "$RAILWAY_BIN")"
+  info "Newer version available: $RAILWAY_VERSION (you have $CURRENT_VERSION)"
+
+  UPGRADE_CONFIRMED=0
+  if [ -n "${FORCE-}" ] || [ ! -t 0 ]; then
+    UPGRADE_CONFIRMED=1
+  else
+    printf "%s " "${MAGENTA}?${NO_COLOR} Upgrade Railway CLI in ${BOLD}$EXISTING_BIN_DIR${NO_COLOR}? ${BOLD}[Y/n]${NO_COLOR}"
+    set +e
+    read -r yn </dev/tty
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      error "Error reading from prompt (please re-run with the '--yes' option)"
+      exit 1
+    fi
+    case "${yn:-y}" in
+      y|Y|yes|YES|Yes) UPGRADE_CONFIRMED=1 ;;
+      *) UPGRADE_CONFIRMED=0 ;;
+    esac
+  fi
+
+  if [ "$UPGRADE_CONFIRMED" != "1" ]; then
+    info "Skipping upgrade. Continuing with $CURRENT_VERSION."
+    info "No PATH changes were made."
+    run_agent_setup "$RAILWAY_BIN"
+    exit 0
+  fi
+
+  info "Upgrading Railway CLI in place: $EXISTING_BIN_DIR"
+  BIN_DIR="$EXISTING_BIN_DIR"
+  RAILWAY_UPGRADE_AGENT=1
+fi
+
+if [ -z "$BIN_DIR" ]; then
+  error "Set RAILWAY_BIN_DIR or pass --bin-dir to choose an install directory."
+  exit 1
+fi
+
 TARGET="$(detect_target "${ARCH}" "${PLATFORM}")"
 
 is_build_available "${ARCH}" "${PLATFORM}" "${TARGET}"
@@ -498,11 +1326,69 @@ fi
 
 URL="${BASE_URL}/download/v${RAILWAY_VERSION}/railway-v${RAILWAY_VERSION}-${TARGET}.${EXT}"
 debug "Tarball URL: ${UNDERLINE}${BLUE}${URL}${NO_COLOR}"
-confirm "Install railway ${GREEN}${RAILWAY_VERSION}${NO_COLOR} to ${BOLD}${GREEN}${BIN_DIR}${NO_COLOR}?"
+if [ "$RAILWAY_UPGRADE_AGENT" != "1" ]; then
+  confirm "Install railway ${GREEN}${RAILWAY_VERSION}${NO_COLOR} to ${BOLD}${GREEN}${BIN_DIR}${NO_COLOR}?"
+fi
+mkdir -p "${BIN_DIR}" || {
+  error "Failed to create installation location ${BIN_DIR}"
+  exit 1
+}
 check_bin_dir "${BIN_DIR}"
+
+if [ "$AGENTS" = 1 ] && [ "$RAILWAY_UPGRADE_AGENT" != "1" ]; then
+  printf '\n%s\n' "${BOLD}Setting up Railway for agents${NO_COLOR}"
+fi
 
 install "${EXT}"
 
+if [ "$AGENTS" = 1 ]; then
+  completed "CLI — v${RAILWAY_VERSION} · $(tildify "$BIN_DIR")"
+else
+  completed "railway was installed successfully to $(tildify "$BIN_DIR/railway")"
+fi
+if [ "$RAILWAY_UPGRADE_AGENT" != "1" ]; then
+  write_env_files
+fi
+
+if ! installed_railway_is_on_path; then
+  if [ "$AGENTS" = 1 ]; then
+    configure_shell_path quiet
+  else
+    configure_shell_path
+  fi
+fi
+
+if [ "$AGENTS" != 1 ]; then
+  warn_existing_path_conflict
+fi
+
+if [ "$AGENTS" = 1 ]; then
+  RAILWAY_BIN="$BIN_DIR/railway"
+  if [ ! -x "$RAILWAY_BIN" ]; then
+    error "Railway CLI install did not produce $RAILWAY_BIN"
+    exit 1
+  fi
+
+  export PATH="$BIN_DIR:$PATH"
+
+  if [ "$RAILWAY_UPGRADE_AGENT" = "1" ]; then
+    info "Upgraded Railway CLI to ${GREEN}${RAILWAY_VERSION}${NO_COLOR}."
+  fi
+
+  print_cli_conflicts quiet
+  run_agent_setup "$RAILWAY_BIN"
+
+  if [ "$RAILWAY_UPGRADE_AGENT" != "1" ] && [ "$PATH_ACTIVATION_PRINTED" != "1" ] && [ -z "$(activation_command)" ]; then
+    # No activation file was written; fall back to a plain PATH note.
+    warn "Railway was installed to $BIN_DIR. Add it to PATH before calling railway in new shells."
+  fi
+
+  print_agent_next_steps
+fi
+
+# The "Poof" banner + telemetry notice are the standalone-CLI install ending;
+# the agent flow prints its own unified "Next steps" closer above instead.
+if [ "$AGENTS" != 1 ]; then
 printf "$MAGENTA"
   cat <<'EOF'
                    .
@@ -515,10 +1401,14 @@ printf "$MAGENTA"
  /. ~~ ,\/I          .               Railway is now installed
  \\L__j^\/I       o               Run `railway help` for commands
   \/--v}  I     o   .
-  |    |  I   _________                    
-  |    |  I c(`       ')o            
+  |    |  I   _________
+  |    |  I c(`       ')o
   |    l  I   \.     ,/
-_/j  L l\_!  _//^---^\\_ 
+_/j  L l\_!  _//^---^\\_
 
 EOF
 printf "$NO_COLOR"
+
+info "Railway collects anonymous CLI usage data to improve the developer experience."
+info "You can opt out anytime: ${BOLD}railway telemetry disable${NO_COLOR} or ${BOLD}RAILWAY_NO_TELEMETRY=1${NO_COLOR}"
+fi

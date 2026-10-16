@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use crate::commands::Configs;
 use anyhow::{Result, bail};
-use async_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue};
+use futures::{SinkExt, StreamExt};
 use graphql_client::GraphQLQuery;
-use graphql_ws_client::{Client, Subscription, graphql::StreamingOperation};
+use graphql_ws_client::{Client, ConnectionActor, Subscription, graphql::StreamingOperation};
+use reqwest_websocket::{RequestBuilderExt, WebSocket};
 
 pub async fn subscribe_graphql<T: GraphQLQuery + Send + Sync + Unpin + 'static>(
     variables: T::Variables,
@@ -11,28 +14,108 @@ where
     <T as GraphQLQuery>::Variables: Send + Sync + Unpin,
     <T as GraphQLQuery>::ResponseData: std::fmt::Debug,
 {
-    let configs = Configs::new()?;
-    let hostname = configs.get_host();
-    let mut request = format!("wss://backboard.{hostname}/graphql/v2").into_client_request()?;
-    let headers = request.headers_mut();
-    if let Some(token) = &Configs::get_railway_token() {
-        headers.insert("project-access-token", HeaderValue::from_str(token)?);
-    } else if let Some(token) = configs.get_railway_auth_token() {
-        headers.insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
-    } else {
-        bail!("Not authorized");
-    }
-    headers.insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_str("graphql-transport-ws").unwrap(),
-    );
-
-    let (connection, _) = async_tungstenite::tokio::connect_async(request).await?;
-
-    Ok(Client::build(connection)
+    Ok(Client::build(connect_websocket("/graphql/v2").await?)
         .subscribe(StreamingOperation::<T>::new(variables))
         .await?)
+}
+
+pub async fn subscribe_graphql_internal<T: GraphQLQuery + Send + Sync + Unpin + 'static>(
+    variables: T::Variables,
+) -> Result<Subscription<StreamingOperation<T>>>
+where
+    <T as GraphQLQuery>::Variables: Send + Sync + Unpin,
+    <T as GraphQLQuery>::ResponseData: std::fmt::Debug,
+{
+    Ok(Client::build(connect_websocket("/graphql/internal").await?)
+        .subscribe(StreamingOperation::<T>::new(variables))
+        .await?)
+}
+
+/// Open one connection for multiple operations. The caller must drive the
+/// actor for as long as it needs the subscriptions.
+pub async fn connect_graphql() -> Result<(Client, ConnectionActor)> {
+    Ok(Client::build(connect_websocket("/graphql/v2").await?).await?)
+}
+
+async fn connect_websocket(path: &str) -> Result<GraphQLWebSocket> {
+    let configs = Configs::new()?;
+    let hostname = configs.get_host();
+    let client = reqwest::Client::default();
+    // This timeout covers the whole upgrade handshake (DNS + TCP + TLS +
+    // 101). On a CPU-starved machine — a CI runner at full load, or a
+    // Railway VM mid-build — 1s is routinely missed even when the network
+    // is fine, and every retry misses it the same way.
+    let mut request = client
+        .get(format!("wss://backboard.{hostname}{path}"))
+        .timeout(Duration::from_secs(10));
+
+    if let Some(token) = &Configs::get_railway_token() {
+        request = request.header("project-access-token", token);
+    } else if let Some(token) = configs.get_railway_auth_token() {
+        request = request.header("authorization", format!("Bearer {token}"));
+    } else {
+        bail!("Not authorized");
+    };
+
+    let resp = request
+        .upgrade()
+        .protocols(["graphql-transport-ws"])
+        .send()
+        .await?;
+    resp.error_for_status_ref()?;
+    let web_socket = resp.into_websocket().await?;
+
+    Ok(GraphQLWebSocket(web_socket))
+}
+
+struct GraphQLWebSocket(WebSocket);
+
+impl graphql_ws_client::Connection for GraphQLWebSocket {
+    fn receive(&mut self) -> impl Future<Output = Option<graphql_ws_client::Message>> + Send {
+        use graphql_ws_client::Message as M2;
+        use reqwest_websocket::Message as M1;
+        async {
+            let message = self.0.next().await?.ok()?;
+            Some(match message {
+                M1::Text(t) => M2::Text(t),
+                M1::Binary(_) => None?,
+                M1::Ping(_) => M2::Ping,
+                M1::Pong(_) => M2::Pong,
+                M1::Close { code, reason } => M2::Close {
+                    code: Some(code.into()),
+                    reason: Some(reason),
+                },
+            })
+        }
+    }
+
+    fn send(
+        &mut self,
+        message: graphql_ws_client::Message,
+    ) -> impl Future<Output = std::result::Result<(), graphql_ws_client::Error>> + Send {
+        use graphql_ws_client::{Error as E2, Message as M2};
+        use reqwest_websocket::{Error as E1, Message as M1};
+        async {
+            let message = match message {
+                M2::Text(t) => M1::Text(t),
+                M2::Close { code, reason } => M1::Close {
+                    code: code.unwrap_or(0).into(),
+                    reason: reason.unwrap_or_default(),
+                },
+                M2::Ping => M1::Ping(Default::default()),
+                M2::Pong => M1::Pong(Default::default()),
+            };
+
+            self.0.send(message).await.map_err(|e| match e {
+                E1::Handshake(handshake_error) => {
+                    E2::Custom("Handshake Error".into(), handshake_error.to_string())
+                }
+                E1::Reqwest(error) => E2::Custom("Reqwest Error".into(), error.to_string()),
+                E1::Tungstenite(error) => E2::Custom("Tungstenite Error".into(), error.to_string()),
+                e => E2::Send(e.to_string()),
+            })?;
+
+            Ok(())
+        }
+    }
 }

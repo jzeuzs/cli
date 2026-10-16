@@ -1,19 +1,21 @@
 use anyhow::bail;
 use is_terminal::IsTerminal;
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::Duration,
-};
+use std::collections::{BTreeMap, HashMap};
 use strum::{Display, EnumIs, EnumIter, IntoEnumIterator};
 
 use crate::{
-    consts::TICK_STRING,
     controllers::{
-        database::DatabaseType, project::ensure_project_and_environment_exist, variables::Variable,
+        database::DatabaseType,
+        github::{resolve_repo_branch, validate_repo_name},
+        project::ensure_project_and_environment_exist,
+        variables::Variable,
     },
-    util::prompt::{
-        self, fake_select, prompt_multi_options, prompt_options, prompt_text,
-        prompt_text_with_placeholder_disappear, prompt_text_with_placeholder_if_blank,
+    util::{
+        progress::create_spinner_if,
+        prompt::{
+            self, fake_select, prompt_multi_options, prompt_options, prompt_text,
+            prompt_text_with_placeholder_disappear, prompt_text_with_placeholder_if_blank,
+        },
     },
 };
 
@@ -21,6 +23,9 @@ use super::*;
 
 /// Add a service to your project
 #[derive(Parser)]
+#[clap(
+    after_help = "Examples:\n\n  railway add --service api --json\n  railway add --database postgres --json\n  railway add --repo railwayapp/starters --branch main --service web --json\n  railway add --image nginx:latest --service web --json\n\nAutomation notes:\n  Non-interactive runs must pass one of --service, --database, --repo, or --image.\n  Use --json for machine-readable output and read stderr separately for progress or selection echoes."
+)]
 pub struct Args {
     /// The name of the database to add
     #[arg(short, long, value_enum)]
@@ -33,6 +38,10 @@ pub struct Args {
     /// The repo to link to the service
     #[clap(short, long)]
     repo: Option<String>,
+
+    /// Branch to deploy from when creating a service from a GitHub repo
+    #[clap(long, requires = "repo")]
+    branch: Option<String>,
 
     /// The docker image to link to the service
     #[clap(short, long)]
@@ -48,6 +57,10 @@ pub struct Args {
     /// Verbose logging
     #[clap(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     verbose: Option<bool>,
+
+    /// Output in JSON format
+    #[clap(long)]
+    json: bool,
 }
 
 pub async fn command(args: Args) -> Result<()> {
@@ -58,7 +71,7 @@ pub async fn command(args: Args) -> Result<()> {
 
     ensure_project_and_environment_exist(&client, &configs, &linked_project).await?;
     if verbose {
-        println!("project and environment exist in linked project exist")
+        eprintln!("project and environment exist in linked project exist")
     }
     let type_of_create = if !args.database.is_empty() {
         fake_select("What do you need?", "Database");
@@ -67,6 +80,7 @@ pub async fn command(args: Args) -> Result<()> {
         fake_select("What do you need?", "GitHub Repo");
         CreateKind::GithubRepo {
             repo: prompt_repo(args.repo)?,
+            branch: args.branch,
             variables: prompt_variables(args.variables)?,
             name: prompt_name(args.service)?,
         }
@@ -84,6 +98,15 @@ pub async fn command(args: Args) -> Result<()> {
             variables: prompt_variables(args.variables)?,
         }
     } else {
+        if !std::io::stdout().is_terminal() {
+            bail!(
+                "Service type required in non-interactive mode. Use one of:\n  \
+                 --database <type>  Add a database (postgres, mysql, redis, mongo)\n  \
+                 --service          Create an empty service\n  \
+                 --repo <repo>      Create a service from a GitHub repo\n  \
+                 --image <image>    Create a service from a Docker image"
+            );
+        }
         let need = prompt_options("What do you need?", CreateKind::iter().collect())?;
         match need {
             CreateKind::Database(_) => CreateKind::Database(prompt_database()?),
@@ -96,6 +119,7 @@ pub async fn command(args: Args) -> Result<()> {
                 let variables = prompt_variables(args.variables)?;
                 CreateKind::GithubRepo {
                     repo,
+                    branch: args.branch,
                     variables,
                     name: prompt_name(args.service)?,
                 }
@@ -112,25 +136,30 @@ pub async fn command(args: Args) -> Result<()> {
         }
     };
     if verbose {
-        println!("{:?}", type_of_create);
+        eprintln!("{:?}", type_of_create);
     }
     match type_of_create {
         CreateKind::Database(databases) => {
+            let is_single_db = databases.len() == 1;
             for db in databases {
                 if verbose {
-                    println!("iterating through databases to add: {:?}", db)
+                    eprintln!("iterating through databases to add: {:?}", db)
                 }
                 deploy::fetch_and_create(
                     &client,
-                    &configs,
+                    &mut configs,
                     db.to_slug().to_string(),
                     &linked_project,
                     &HashMap::new(),
                     verbose,
+                    args.json,
+                    deploy::FetchAndCreateOptions {
+                        should_link: is_single_db,
+                    },
                 )
                 .await?;
                 if verbose {
-                    println!("succesfully created {:?}", db)
+                    eprintln!("successfully created {:?}", db)
                 }
             }
         }
@@ -145,14 +174,17 @@ pub async fn command(args: Args) -> Result<()> {
                 &client,
                 &mut configs,
                 None,
+                None,
                 Some(image),
                 variables,
                 verbose,
+                args.json,
             )
             .await?;
         }
         CreateKind::GithubRepo {
             repo,
+            branch,
             variables,
             name,
         } => {
@@ -162,9 +194,11 @@ pub async fn command(args: Args) -> Result<()> {
                 &client,
                 &mut configs,
                 Some(repo),
+                branch,
                 None,
                 variables,
                 verbose,
+                args.json,
             )
             .await?;
         }
@@ -176,8 +210,10 @@ pub async fn command(args: Args) -> Result<()> {
                 &mut configs,
                 None,
                 None,
+                None,
                 variables,
                 verbose,
+                args.json,
             )
             .await?;
         }
@@ -245,7 +281,7 @@ fn prompt_variables(variables: Vec<Variable>) -> Result<Option<BTreeMap<String, 
     }
     if variables.is_empty() {
         return Ok(Some(
-            prompt::prompt_variables()?
+            prompt::prompt_variables(None)?
                 .into_iter()
                 .map(|v| (v.key, v.value))
                 .collect(),
@@ -271,57 +307,49 @@ async fn create_service(
     client: &reqwest::Client,
     configs: &mut Configs,
     repo: Option<String>,
+    branch: Option<String>,
     image: Option<String>,
     variables: Variables,
     verbose: bool,
+    json: bool,
 ) -> Result<(), anyhow::Error> {
-    let spinner = indicatif::ProgressBar::new_spinner()
-        .with_style(
-            indicatif::ProgressStyle::default_spinner()
-                .tick_chars(TICK_STRING)
-                .template("{spinner:.green} {msg}")?,
-        )
-        .with_message("Creating service...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
+    let spinner = create_spinner_if(!json, "Creating service...".into());
     let source = mutations::service_create::ServiceSourceInput { repo, image };
     let branch = if let Some(repo) = &source.repo {
+        validate_repo_name(repo)?;
         if verbose {
-            println!("fetching branch for github repo {repo}")
+            eprintln!("fetching branch for github repo {repo}")
         }
-        let repos = post_graphql::<queries::GitHubRepos, _>(
-            client,
-            &configs.get_backboard(),
-            queries::git_hub_repos::Variables {},
-        )
-        .await?
-        .github_repos;
-        let repo = repos
-            .iter()
-            .find(|r| r.full_name == *repo)
-            .ok_or(anyhow::anyhow!("repo not found"))?;
-        Some(repo.default_branch.clone())
+        Some(resolve_repo_branch(client, configs, repo, branch).await?)
     } else {
         None
     };
     let vars = mutations::service_create::Variables {
         name: service,
         project_id: linked_project.project.clone(),
-        environment_id: linked_project.environment.clone(),
+        environment_id: Some(linked_project.environment_id()?.to_string()),
         source: Some(source),
         variables,
         branch,
     };
     if verbose {
-        println!("creating service");
+        eprintln!("creating service");
     }
     let s =
         post_graphql::<mutations::ServiceCreate, _>(client, &configs.get_backboard(), vars).await?;
-    configs.link_service(s.service_create.id)?;
+    configs.link_service(s.service_create.id.clone())?;
     configs.write()?;
-    spinner.finish_with_message(format!(
-        "Successfully created the service \"{}\" and linked to it",
-        s.service_create.name.blue()
-    ));
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"id": s.service_create.id, "name": s.service_create.name})
+        );
+    } else if let Some(spinner) = spinner {
+        spinner.finish_with_message(format!(
+            "Successfully created the service \"{}\" and linked to it",
+            s.service_create.name.blue()
+        ));
+    }
     Ok(())
 }
 
@@ -330,6 +358,7 @@ enum CreateKind {
     #[strum(to_string = "GitHub Repo")]
     GithubRepo {
         repo: String,
+        branch: Option<String>,
         variables: Variables,
         name: Option<String>,
     },

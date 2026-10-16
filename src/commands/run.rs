@@ -19,6 +19,9 @@ use super::{queries::project::ProjectProject, *};
 
 /// Run a local command using variables from the active environment
 #[derive(Debug, Parser)]
+#[clap(
+    after_help = "Examples:\n\n  railway run --service api --environment production -- npm run migrate\n  railway run --project project-id --environment production --service api -- node script.js\n  railway run --service api -- printenv PORT\n\nAutomation notes:\n  Put Railway flags before the child command. Flags after the child command are passed to the child process.\n  `railway run env` and `railway run printenv` can print secret variable values. Avoid sharing command output."
+)]
 pub struct Args {
     /// Service to pull variables from (defaults to linked service)
     #[clap(short, long)]
@@ -27,6 +30,10 @@ pub struct Args {
     /// Environment to pull variables from (defaults to linked environment)
     #[clap(short, long)]
     environment: Option<String>,
+
+    /// Project ID to use (defaults to linked project)
+    #[clap(short = 'p', long, value_name = "PROJECT_ID")]
+    project: Option<String>,
 
     /// Skip local develop overrides even if docker-compose.yml exists
     #[clap(long)]
@@ -41,13 +48,11 @@ pub struct Args {
     args: Vec<String>,
 }
 
-async fn get_service(
-    configs: &Configs,
+fn get_service(
     project: &ProjectProject,
     service_arg: Option<String>,
+    linked_service: Option<String>,
 ) -> Result<String> {
-    let linked_project = configs.get_linked_project().await?;
-
     let services = project.services.edges.iter().collect::<Vec<_>>();
 
     let service = if let Some(service_arg) = service_arg {
@@ -60,7 +65,7 @@ async fn get_service(
         } else {
             bail!("Service not found");
         }
-    } else if let Some(service) = linked_project.service {
+    } else if let Some(service) = linked_service {
         // If the user didn't specify a service, but we have a linked service, use that
         service
     } else {
@@ -85,28 +90,56 @@ async fn get_service(
 }
 
 pub async fn command(args: Args) -> Result<()> {
-    // only needs to be mutable for the update check
     let configs = Configs::new()?;
 
     let client = GQLClient::new_authorized(&configs)?;
-    let linked_project = configs.get_linked_project().await?;
 
-    ensure_project_and_environment_exist(&client, &configs, &linked_project).await?;
+    if args.project.is_some() && args.environment.is_none() {
+        bail!("--environment is required when using --project");
+    }
 
-    let project = get_project(&client, &configs, linked_project.project.clone()).await?;
+    let linked_project = if args.project.is_none() {
+        Some(configs.get_linked_project().await?)
+    } else {
+        None
+    };
+
+    if let Some(ref lp) = linked_project {
+        ensure_project_and_environment_exist(&client, &configs, lp).await?;
+    }
+
+    let project_id = args
+        .project
+        .clone()
+        .or_else(|| linked_project.as_ref().map(|lp| lp.project.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("No project specified. Use --project or run `railway link` first")
+        })?;
+
+    let project = get_project(&client, &configs, project_id.clone()).await?;
 
     let environment = args
         .environment
         .clone()
-        .unwrap_or(linked_project.environment.clone());
+        .or_else(|| {
+            linked_project
+                .as_ref()
+                .and_then(|lp| lp.environment.clone())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No environment specified. Set RAILWAY_ENVIRONMENT_ID, use --environment, or run `railway environment` to link one."
+            )
+        })?;
 
     let environment_id = get_matched_environment(&project, environment)?.id;
-    let service = get_service(&configs, &project, args.service.clone()).await?;
+    let linked_service = linked_project.as_ref().and_then(|lp| lp.service.clone());
+    let service = get_service(&project, args.service.clone(), linked_service)?;
 
     let mut variables = get_service_variables(
         &client,
         &configs,
-        linked_project.project.clone(),
+        project_id.clone(),
         environment_id.clone(),
         service.clone(),
     )
@@ -121,6 +154,13 @@ pub async fn command(args: Args) -> Result<()> {
             inject_mkcert_ca_vars(&mut variables);
         }
         eprintln!("{}", "Using local develop services".yellow());
+    }
+
+    // Service variables are project-writable, and this command runs as the local
+    // user. Drop the names a shell or runtime would execute during startup.
+    let dropped = crate::util::host_env::strip_unsafe_host_vars(&mut variables);
+    if let Some(notice) = crate::util::host_env::dropped_notice(&dropped) {
+        eprintln!("{}", notice.yellow());
     }
 
     // a bit janky :/

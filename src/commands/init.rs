@@ -1,3 +1,5 @@
+use is_terminal::IsTerminal;
+
 use crate::errors::RailwayError;
 use crate::util::prompt::{fake_select, prompt_select, prompt_text_with_placeholder_if_blank};
 use crate::workspace::{Workspace, workspaces};
@@ -6,7 +8,10 @@ use super::*;
 
 /// Create a new project
 #[derive(Parser)]
-#[clap(alias = "new")]
+#[clap(
+    visible_alias = "new",
+    after_help = "Examples:\n\n  railway init --name api --json\n  railway init --name api --workspace workspace-id --json\n\nAutomation notes:\n  This creates a project and links the current directory to the project's default environment.\n  Use an exact workspace ID or name when running outside a terminal."
+)]
 pub struct Args {
     /// Project name
     #[clap(short, long)]
@@ -15,6 +20,10 @@ pub struct Args {
     /// Workspace ID or name
     #[clap(short, long)]
     workspace: Option<String>,
+
+    /// Output in JSON format
+    #[clap(long)]
+    json: bool,
 }
 
 pub async fn command(args: Args) -> Result<()> {
@@ -53,28 +62,38 @@ pub async fn command(args: Args) -> Result<()> {
     configs.link_project(
         project_create.id.clone(),
         Some(project_create.name.clone()),
-        environment.id,
-        Some(environment.name),
+        environment.id.clone(),
+        Some(environment.name.clone()),
     )?;
     configs.write()?;
 
-    println!(
-        "\n{} {} on {}",
-        "Created project".green().bold(),
-        project_create.name.bold(),
-        workspace,
-    );
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": project_create.id,
+                "name": project_create.name
+            })
+        );
+    } else {
+        println!(
+            "\n{} {} on {}",
+            "Created project".green().bold(),
+            project_create.name.bold(),
+            workspace,
+        );
 
-    println!(
-        "{}",
-        format!(
-            "https://{}/project/{}",
-            configs.get_host(),
-            project_create.id
-        )
-        .bold()
-        .underline()
-    );
+        println!(
+            "{}",
+            format!(
+                "https://{}/project/{}",
+                configs.get_host(),
+                project_create.id
+            )
+            .bold()
+            .underline()
+        );
+    }
     Ok(())
 }
 
@@ -96,6 +115,10 @@ fn prompt_workspace(workspaces: Vec<Workspace>, workspace: Option<String>) -> Re
         return Ok(select(&workspaces[0]));
     }
 
+    if !std::io::stdout().is_terminal() {
+        bail!("--workspace required in non-interactive mode (multiple workspaces available)");
+    }
+
     let workspace = prompt_select("Select a workspace", workspaces)?;
     Ok(workspace)
 }
@@ -105,6 +128,10 @@ fn prompt_project_name(name: Option<String>) -> Result<String> {
         fake_select("Project Name", &name);
 
         return Ok(name);
+    }
+
+    if !std::io::stdout().is_terminal() {
+        return Ok(String::new());
     }
 
     let maybe_name = prompt_text_with_placeholder_if_blank(

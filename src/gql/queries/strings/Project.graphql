@@ -2,9 +2,18 @@ query Project($id: String!) {
   project(id: $id) {
     id
     name
+    workspaceId
     deletedAt
     workspace {
       name
+    }
+    buckets {
+      edges {
+        node {
+          id
+          name
+        }
+      }
     }
     environments {
       edges {
@@ -13,58 +22,7 @@ query Project($id: String!) {
           name
           canAccess
           deletedAt
-          serviceInstances {
-            edges {
-              node {
-                id
-                serviceId
-                serviceName
-                environmentId
-                latestDeployment {
-                  canRedeploy
-                  id
-                  meta
-                  status
-                  createdAt
-                  deploymentStopped
-                }
-                source {
-                  repo
-                  image
-                }
-                domains {
-                  serviceDomains {
-                    id
-                    domain
-                    targetPort
-                  }
-                  customDomains {
-                    id
-                    domain
-                    targetPort
-                  }
-                }
-                cronSchedule
-                nextCronRunAt
-                startCommand
-              }
-            }
-          }
-          volumeInstances {
-            edges {
-              node {
-                serviceId
-                mountPath
-                environmentId
-                currentSizeMB
-                sizeMB
-                volume {
-                  name
-                  id
-                }
-              }
-            }
-          }
+          unmergedChangesCount
         }
       }
     }

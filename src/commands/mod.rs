@@ -1,6 +1,6 @@
 pub(super) use crate::{client::*, config::*, gql::*};
 pub(super) use anyhow::{Context, Result, bail};
-pub(super) use clap::{Parser, Subcommand};
+pub(super) use clap::Parser;
 pub(super) use colored::Colorize;
 
 pub fn get_dynamic_args(cmd: clap::Command) -> clap::Command {
@@ -9,8 +9,18 @@ pub fn get_dynamic_args(cmd: clap::Command) -> clap::Command {
 }
 
 pub mod add;
+pub mod api;
+pub mod autoupdate;
+pub mod bucket;
+pub mod cdn;
+pub mod cloud_agent;
+pub mod code;
 pub mod completion;
+pub mod config;
 pub mod connect;
+pub mod cron;
+pub mod database;
+pub mod delete;
 pub mod deploy;
 pub mod deployment;
 pub mod dev;
@@ -18,6 +28,7 @@ pub mod docs;
 pub mod domain;
 pub mod down;
 pub mod environment;
+pub mod flag;
 pub mod functions;
 pub mod init;
 pub mod link;
@@ -25,19 +36,40 @@ pub mod list;
 pub mod login;
 pub mod logout;
 pub mod logs;
+pub mod mcp;
+pub mod metrics;
+pub mod mysql;
 pub mod open;
+pub mod outbound_networking;
+mod output;
+pub mod postgres;
+pub mod private_network;
+pub mod project;
 pub mod redeploy;
+pub mod redis;
+pub mod restart;
 pub mod run;
+pub mod sandbox;
 pub mod scale;
 pub mod service;
+pub mod setup;
 pub mod shell;
+pub mod skills;
 pub mod ssh;
 pub mod starship;
 pub mod status;
+pub mod tcp_proxy;
+pub mod telemetry_cmd;
+pub mod templates;
+pub mod trace;
 pub mod unlink;
 pub mod up;
-pub mod variables;
+pub mod upgrade;
+pub mod usage;
+pub mod variable;
 pub mod volume;
+pub mod waf;
 pub mod whoami;
 
+pub mod agent;
 pub mod check_updates;

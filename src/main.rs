@@ -1,33 +1,62 @@
 use std::cmp::Ordering;
+use std::ffi::OsString;
 
 use anyhow::Result;
 use clap::error::ErrorKind;
 
 mod commands;
+mod iac;
 use commands::*;
+use config::Configs;
+use errors::RailwayError;
 use is_terminal::IsTerminal;
-use util::{check_update::UpdateCheck, compare_semver::compare_semver};
+use util::{
+    check_update::{UPDATE_CHECK_INTERVAL_HOURS, UpdateCheck},
+    compare_semver::compare_semver,
+};
 
+#[cfg(test)]
+mod auth_sim;
 mod client;
 mod config;
 mod consts;
 mod controllers;
 mod errors;
+mod exec_context;
 mod gql;
+#[cfg(test)]
+mod help_tests;
+mod oauth;
+mod resources;
 mod subscription;
 mod table;
+#[cfg(test)]
+mod testkit;
+pub mod tui_theme;
 mod util;
+mod vt100;
 mod workspace;
 
 #[macro_use]
 mod macros;
+mod telemetry;
 
 // Generates the commands based on the modules in the commands directory
 // Specify the modules you want to include in the commands_enum! macro
 commands!(
     add,
+    agent,
+    api,
+    autoupdate,
+    bucket,
+    cdn,
+    cloud_agent as "ca",
+    code,
     completion,
+    config,
     connect,
+    cron,
+    delete,
     deploy,
     deployment,
     dev(develop),
@@ -35,93 +64,321 @@ commands!(
     docs,
     down,
     environment(env),
+    flag(flags),
     init,
     link,
     list,
     login,
     logout,
     logs,
+    mcp,
+    metrics,
     open,
-    run,
+    outbound_networking as "outbound-network",
+    mysql,
+    postgres,
+    project,
+    private_network as "private-network",
+    run(local),
+    sandbox(sandboxes, sbx),
     service,
+    setup,
     shell,
+    skills,
     ssh,
     starship,
     status,
+    telemetry_cmd(telemetry),
+    templates,
+    tcp_proxy as "tcp-proxy",
+    trace(traces, tracing),
     unlink,
     up,
-    variables,
+    upgrade,
+    usage,
+    variable(variables, vars, var),
+    waf,
     whoami,
     volume,
     redeploy,
+    redis,
+    restart,
     scale,
     check_updates,
     functions(function, func, fn, funcs, fns)
 );
 
-fn spawn_update_task() -> tokio::task::JoinHandle<anyhow::Result<Option<String>>> {
-    tokio::spawn(async move {
-        // outputting would break json output on CI
-        if !std::io::stdout().is_terminal() {
-            anyhow::bail!("Stdout is not a terminal");
-        }
-        let latest_version = util::check_update::check_update(false).await?;
+/// Groups the state needed to decide whether and how to check for / dispatch
+/// a background update.
+struct UpdateContext {
+    known_version: Option<String>,
+    skipped_version: Option<String>,
+    check_gate_armed: bool,
+    check_skills: bool,
+}
 
+/// Routes a pending version to the appropriate background updater.
+fn try_dispatch_update(
+    version: &str,
+    skipped_version: Option<&str>,
+    method: &util::install_method::InstallMethod,
+) {
+    if skipped_version == Some(version) {
+        return;
+    }
+    if method.can_self_update() && method.can_write_binary() {
+        let _ = util::self_update::spawn_background_download(version);
+    } else if method.can_auto_run_package_manager() {
+        let _ = util::check_update::spawn_package_manager_update(*method);
+    }
+}
+
+fn spawn_update_task(
+    ctx: UpdateContext,
+) -> tokio::task::JoinHandle<anyhow::Result<Option<String>>> {
+    tokio::spawn(async move {
+        let method = util::install_method::InstallMethod::detect();
+
+        // Safe to eagerly dispatch from cache: the gate means no API call
+        // will race with a newer version during this invocation.
+        if ctx.check_gate_armed {
+            if let Some(ref version) = ctx.known_version {
+                try_dispatch_update(version, ctx.skipped_version.as_deref(), &method);
+            }
+        }
+
+        // CLI version check and skills staleness check share this task's budget
+        // — run them concurrently so a slow API call on one doesn't starve the
+        // other within the short window handle_update_task() waits.
+        let cli_check = async {
+            let (from_cache, latest_version) = match util::check_update::check_update(false).await {
+                Ok(Some(v)) => (false, Some(v)),
+                Ok(None) | Err(_) => (ctx.known_version.is_some(), ctx.known_version.clone()),
+            };
+
+            if let Some(ref version) = latest_version {
+                if !from_cache {
+                    try_dispatch_update(version, ctx.skipped_version.as_deref(), &method);
+                }
+            }
+            latest_version
+        };
+
+        // Dispatch cached updates and post-CLI-upgrade syncs before any network
+        // work so short-lived commands can't starve them. Otherwise check for
+        // skill releases independently of CLI releases, on the hourly gate.
+        let skills_check = async {
+            if ctx.check_skills {
+                if !commands::skills::cached_skill_auto_apply_due() {
+                    commands::skills::refresh_skill_update_state().await;
+                }
+                if commands::skills::cached_skill_auto_apply_due() {
+                    commands::skills::spawn_background_skill_update();
+                }
+            }
+        };
+
+        let (latest_version, ()) = tokio::join!(cli_check, skills_check);
         Ok(latest_version)
     })
 }
 
+fn project_command_suggestion(raw_args: &[String]) -> Option<&'static str> {
+    let raw_subcommand = raw_args.iter().find(|arg| !arg.starts_with('-'))?;
+
+    if raw_subcommand == "projects" {
+        Some("I think you meant `railway project`; running that command instead.")
+    } else {
+        None
+    }
+}
+
+/// Waits for the background update task to finish, but no longer than a
+/// couple of seconds so that short-lived commands are not noticeably delayed.
+/// The heavy download work runs in a detached process, so this timeout only
+/// gates the fast version-check API call.
 async fn handle_update_task(
     handle: Option<tokio::task::JoinHandle<anyhow::Result<Option<String>>>>,
 ) {
+    use std::time::Duration;
+
     if let Some(handle) = handle {
-        match handle.await {
-            Ok(Ok(_)) => {} // Task completed successfully
-            Ok(Err(e)) => {
-                if !std::io::stdout().is_terminal() {
-                    eprintln!("Failed to check for updates (not fatal)");
-                    eprintln!("{e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("Check Updates: Task panicked or failed to execute.");
-                eprintln!("{e}");
-            }
+        match tokio::time::timeout(Duration::from_secs(1), handle).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {} // update error or task panic — non-fatal
+            Err(_) => {} // timeout — the API check was slow; next invocation retries
         }
     }
 }
 
+/// Runs in a detached child process to download and stage an update.
+async fn background_stage_update(version: &str) -> Result<()> {
+    use util::check_update::UpdateCheck;
+
+    let result = async {
+        if telemetry::is_auto_update_disabled() {
+            return Ok(());
+        }
+
+        match util::self_update::download_and_stage(version).await {
+            Ok(true) => {}  // Staged successfully; cache stays until try_apply_staged() succeeds.
+            Ok(false) => {} // Lock held by another process, will retry
+            Err(_) => UpdateCheck::record_download_failure(),
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Ok(pid_path) = util::self_update::download_update_pid_path() {
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = build_args().try_get_matches();
-    let check_updates_handle = if std::io::stdout().is_terminal() {
-        let update = UpdateCheck::read().unwrap_or_default();
+    // Internal: detached background download spawned by a prior invocation.
+    if let Ok(version) = std::env::var(consts::RAILWAY_STAGE_UPDATE_ENV) {
+        return background_stage_update(&version).await;
+    }
 
-        if let Some(latest_version) = update.latest_version {
-            if matches!(
-                compare_semver(env!("CARGO_PKG_VERSION"), &latest_version),
-                Ordering::Less
-            ) {
-                println!(
-                    "{} v{} visit {} for more info",
+    // Internal: detached background skills refresh spawned by a prior invocation.
+    if std::env::var(consts::RAILWAY_UPDATE_SKILLS_ENV).is_ok() {
+        let _ = commands::skills::apply_update_in_background().await;
+        return Ok(());
+    }
+
+    let raw_os_args: Vec<OsString> = std::env::args_os().collect();
+    let normalized_os_args = scale::normalize_legacy_scale_args(raw_os_args.clone());
+    let args = build_args().try_get_matches_from(normalized_os_args);
+    let is_tty = std::io::stdout().is_terminal();
+    // Help, version, and parse-error paths are read-only: no staged-binary
+    // apply, no background update spawn, no extra latency.
+    let is_help_or_error = args.as_ref().is_err();
+
+    // Peek at the subcommand early so we can skip the staged-update
+    // apply and background updater when the user is explicitly managing
+    // updates (`railway upgrade` or `railway autoupdate`).
+    // Check raw args too so that help/error paths (where clap returns Err)
+    // are also detected — e.g. `railway upgrade --help` should not apply
+    // a staged update as a side effect.
+    let raw_args: Vec<String> = raw_os_args
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let raw_subcommand = raw_args.iter().find(|a| !a.starts_with('-')).cloned();
+
+    let is_update_management_cmd = matches!(
+        raw_subcommand.as_deref(),
+        Some("upgrade" | "autoupdate" | "check_updates" | "check-updates")
+    );
+    // Bare `railway` and `railway help` show help — treat as read-only so
+    // first-time users don't trigger update side effects.
+    let is_read_only_invocation = is_help_or_error
+        || raw_subcommand.is_none()
+        || matches!(raw_subcommand.as_deref(), Some("help"))
+        || args.as_ref().is_ok_and(is_code_get_config);
+    let auto_update_enabled = !telemetry::is_auto_update_disabled();
+    let machine_output = raw_args.iter().any(|arg| arg == "--json");
+    let embedded_setup = std::env::var("RAILWAY_SETUP_EMBEDDED").is_ok();
+    let normal_invocation = !is_update_management_cmd
+        && !is_read_only_invocation
+        && !matches!(
+            raw_subcommand.as_deref(),
+            Some("skills" | "setup" | "completion")
+        );
+    let show_update_receipt = auto_update_enabled
+        && normal_invocation
+        && is_tty
+        && std::io::stderr().is_terminal()
+        && !machine_output
+        && !embedded_setup;
+
+    if auto_update_enabled && normal_invocation && !embedded_setup {
+        let (managed, previous) = commands::skills::managed_install_info();
+        util::update_status::observe_running(
+            env!("CARGO_PKG_VERSION"),
+            previous.as_deref(),
+            managed,
+        );
+    }
+
+    // Non-TTY invocations are a supported path for coding agents and other
+    // automated CLI users. They are allowed to refresh the update cache and
+    // kick off background installs, but we keep staged-binary apply TTY-only
+    // so the running binary never changes under a scripted invocation.
+    let auto_update_applied = auto_update_enabled
+        && is_tty
+        && !machine_output
+        && !is_update_management_cmd
+        && !is_read_only_invocation
+        && util::self_update::try_apply_staged().is_some();
+
+    let update = UpdateCheck::read_normalized();
+    let skipped_version = update.skipped_version.clone();
+    let check_gate_armed = update
+        .last_update_check
+        .map(|t| (chrono::Utc::now() - t) < chrono::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS))
+        .unwrap_or(false);
+
+    // Pass any pending version to spawn_update_task so it can skip the
+    // interval short-circuit and retry a download that timed out in a
+    // prior run.  The background task clears latest_version on success.
+    //
+    // If the running binary has already caught up to (or surpassed) the
+    // cached version, clear the stale cache so spawn_update_task falls
+    // through to a fresh check_update() and can discover newer releases.
+    let known_pending = update.latest_version;
+
+    // Automatic discovery/downloads are quiet. Installs requiring manual action
+    // get one notice per release; completed automatic updates get one receipt.
+    if show_update_receipt {
+        // Present a completed prior attempt before a retry can mark skills
+        // pending again. Fast background completions also get a chance at exit.
+        if let Some(receipt) = util::update_status::take_receipt() {
+            eprintln!("{receipt}");
+        }
+        if let Some(ref latest_version) = known_pending {
+            let method = util::install_method::InstallMethod::detect();
+            let can_install = (method.can_self_update() && method.can_write_binary())
+                || method.can_auto_run_package_manager();
+            let is_skipped = skipped_version.as_deref() == Some(latest_version.as_str());
+            if !can_install
+                && !is_skipped
+                && matches!(
+                    compare_semver(env!("CARGO_PKG_VERSION"), latest_version),
+                    Ordering::Less
+                )
+                && util::update_status::available_notice_due(latest_version)
+            {
+                eprintln!(
+                    "{} v{} run {} to update ({} for more info)",
                     "New version available:".green().bold(),
                     latest_version.yellow(),
+                    "railway upgrade".cyan(),
                     "https://docs.railway.com/guides/cli".purple(),
                 );
             }
-            let update = UpdateCheck {
-                last_update_check: Some(chrono::Utc::now()),
-                latest_version: None,
-            };
-            update
-                .write()
-                .context("Failed to save time since last update check")?;
         }
+    }
 
-        Some(spawn_update_task())
-    } else {
-        None
-    };
+    // Automatic checks and installs share the same opt-out, including non-TTY
+    // callers. Explicit update-management commands handle their own checks.
+    let check_updates_handle =
+        if !auto_update_enabled || is_update_management_cmd || is_read_only_invocation {
+            None
+        } else {
+            Some(spawn_update_task(UpdateContext {
+                known_version: known_pending,
+                skipped_version,
+                check_gate_armed,
+                // `skills`/`setup` write the manifest themselves; don't have the
+                // background check race their write.
+                check_skills: !matches!(raw_subcommand.as_deref(), Some("skills" | "setup")),
+            }))
+        };
 
     // https://github.com/clap-rs/clap/blob/cb2352f84a7663f32a89e70f01ad24446d5fa1e2/clap_builder/src/error/mod.rs#L210-L215
     let cli = match args {
@@ -130,6 +387,19 @@ async fn main() -> Result<()> {
         // printed to stdout and exit with a status of 0.
         Err(e) if e.kind() == ErrorKind::DisplayHelp || e.kind() == ErrorKind::DisplayVersion => {
             println!("{e}");
+            // Root help doubles as a lightweight health check: tell users
+            // with coding tools installed when Railway skills/MCP config is
+            // missing, pointing at `railway setup agent`. Scoped to root
+            // help only — both `railway <cmd> --help` and `railway help
+            // <cmd>` stay clean (the count guard catches the latter, where
+            // the first non-flag arg is still "help").
+            let non_flag_args = raw_args.iter().filter(|a| !a.starts_with('-')).count();
+            if e.kind() == ErrorKind::DisplayHelp
+                && matches!(raw_subcommand.as_deref(), None | Some("help"))
+                && non_flag_args <= 1
+            {
+                commands::setup::print_agent_health_check();
+            }
             handle_update_task(check_updates_handle).await;
             std::process::exit(0);
         }
@@ -140,20 +410,724 @@ async fn main() -> Result<()> {
         }
     };
 
-    let exec_result = exec_cli(cli).await;
+    if let Some(suggestion) = project_command_suggestion(&raw_args) {
+        eprintln!("{suggestion}");
+    }
+
+    if command_needs_refresh(&cli) {
+        if let Ok(mut configs) = Configs::new() {
+            if let Err(e) = client::ensure_valid_token(&mut configs).await {
+                // A revoked/expired login is the actual cause of the
+                // "Unauthorized" the command is about to fail with, so say so
+                // here rather than letting the generic message stand in for it.
+                // The credential has already been cleared by this point.
+                if matches!(
+                    e.downcast_ref::<RailwayError>(),
+                    Some(RailwayError::OAuthInvalidGrant(_))
+                ) {
+                    eprintln!("{}", format!("{e}").red());
+                } else {
+                    eprintln!("{}: {e}", "Warning: failed to refresh OAuth token".yellow());
+                }
+            }
+        }
+    }
+
+    let saved_config_only = is_code_get_config(&cli);
+    let subcommand_name = cli.subcommand_name().map(str::to_string);
+    // Saved connection replay is entirely local, including skipping telemetry.
+    let exec_result = if saved_config_only {
+        let args = <commands::code::Args as clap::FromArgMatches>::from_arg_matches(
+            cli.subcommand().unwrap().1,
+        )?;
+        commands::code::command(args).await
+    } else {
+        exec_cli(cli).await
+    };
+
+    // Send telemetry for silent auto-update apply (after auth is available).
+    if auto_update_applied {
+        telemetry::send(telemetry::CliTrackEvent {
+            command: "autoupdate_apply".to_string(),
+            sub_command: None,
+            success: true,
+            error_message: None,
+            duration_ms: 0,
+            cli_version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            is_ci: Configs::env_is_ci(),
+        })
+        .await;
+    }
 
     if let Err(e) = exec_result {
-        if e.root_cause().to_string() == inquire::InquireError::OperationInterrupted.to_string() {
-            return Ok(()); // Exit gracefully if interrupted
+        let root_cause = e.root_cause().to_string();
+        if root_cause == inquire::InquireError::OperationInterrupted.to_string()
+            || root_cause == inquire::InquireError::OperationCanceled.to_string()
+        {
+            eprintln!("Operation cancelled.");
+            handle_update_task(check_updates_handle).await;
+            std::process::exit(130);
         }
 
-        eprintln!("{e:?}");
+        crate::util::reporter::render_error(&e);
 
         handle_update_task(check_updates_handle).await;
         std::process::exit(1);
     }
 
+    if !saved_config_only {
+        util::agent_advisory::maybe_show(&raw_args, subcommand_name.as_deref()).await;
+        util::cac_deprecation::maybe_warn(&raw_args, subcommand_name.as_deref());
+    }
+
     handle_update_task(check_updates_handle).await;
 
+    if show_update_receipt {
+        if let Some(receipt) = util::update_status::take_receipt() {
+            eprintln!("{receipt}");
+        }
+    }
+
     Ok(())
+}
+
+fn is_code_get_config(cli: &clap::ArgMatches) -> bool {
+    matches!(cli.subcommand(), Some(("code", args)) if args.subcommand_name() == Some("get-config"))
+}
+
+fn command_needs_refresh(cli: &clap::ArgMatches) -> bool {
+    // Commands that do not require authentication -- skip token refresh for these.
+    const NO_AUTH_COMMANDS: &[&str] = &[
+        "login",
+        "logout",
+        "completion",
+        "docs",
+        "setup",
+        "skills",
+        "upgrade",
+        "autoupdate",
+        "telemetry_cmd",
+        "check_updates",
+    ];
+
+    let is_mcp_install = matches!(
+        cli.subcommand(),
+        Some(("mcp", mcp_matches)) if mcp_matches.subcommand_name() == Some("install")
+    );
+
+    let is_public_templates_command = matches!(
+        cli.subcommand(),
+        Some(("templates", template_matches))
+            if matches!(
+                template_matches.subcommand_name(),
+                Some("search" | "find" | "list" | "ls")
+            )
+    );
+
+    cli.subcommand_name()
+        .map(|cmd| {
+            !NO_AUTH_COMMANDS.contains(&cmd)
+                && !is_mcp_install
+                && !is_public_templates_command
+                && !is_code_get_config(cli)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
+        let mut full_args = vec!["railway"];
+        full_args.extend(args);
+        let full_args = full_args.into_iter().map(OsString::from).collect();
+        build_args().try_get_matches_from(scale::normalize_legacy_scale_args(full_args))
+    }
+
+    fn assert_parses(args: &[&str]) {
+        assert!(
+            parse(args).is_ok(),
+            "Command should parse: railway {}",
+            args.join(" ")
+        );
+    }
+
+    fn assert_subcommand(args: &[&str], expected: &str) {
+        let matches = parse(args).unwrap_or_else(|_| panic!("Failed to parse: {:?}", args));
+        assert_eq!(
+            matches.subcommand_name(),
+            Some(expected),
+            "Expected subcommand '{}' for args {:?}",
+            expected,
+            args
+        );
+    }
+
+    mod backwards_compat {
+        use super::*;
+
+        #[test]
+        fn root_commands_exist() {
+            assert_subcommand(&["logs"], "logs");
+            assert_subcommand(&["list"], "list");
+            assert_subcommand(&["delete"], "delete");
+            assert_subcommand(&["restart"], "restart");
+            assert_subcommand(&["scale"], "scale");
+            assert_parses(&["scale", "eu-west=2"]);
+            assert_parses(&["scale", "--eu-west", "2"]);
+            assert_parses(&["scale", "--service", "worker", "eu-west=2", "us-east=1"]);
+            assert_parses(&["scale", "eu-west=2", "--json"]);
+            assert_subcommand(&["link"], "link");
+            assert_subcommand(&["up"], "up");
+            assert_subcommand(&["redeploy"], "redeploy");
+            assert_subcommand(&["cdn", "status"], "cdn");
+            assert_subcommand(&["waf", "under-attack", "status"], "waf");
+            assert_subcommand(&["tcp-proxy", "list"], "tcp-proxy");
+        }
+
+        #[test]
+        fn variable_aliases() {
+            assert_subcommand(&["variable"], "variable");
+            assert_subcommand(&["variables"], "variable");
+            assert_subcommand(&["vars"], "variable");
+            assert_subcommand(&["var"], "variable");
+        }
+
+        #[test]
+        fn logs_http_flag_parses() {
+            assert_parses(&["logs", "--http"]);
+            assert_parses(&["logs", "--http", "--lines", "50"]);
+            assert_parses(&["service", "logs", "--http"]);
+        }
+
+        #[test]
+        fn deployment_list_project_flag_parses() {
+            assert_parses(&[
+                "deployment",
+                "list",
+                "--project",
+                "project-id",
+                "--environment",
+                "production",
+                "--service",
+                "api",
+            ]);
+        }
+
+        #[test]
+        fn logs_http_examples_parse() {
+            assert_parses(&["logs", "--http", "--lines", "50"]);
+            assert_parses(&[
+                "logs",
+                "--http",
+                "--filter",
+                "@path:/api/users @httpStatus:200",
+            ]);
+            assert_parses(&[
+                "logs",
+                "--http",
+                "--json",
+                "--filter",
+                "@requestId:abcd1234",
+            ]);
+            assert_parses(&[
+                "service",
+                "logs",
+                "--http",
+                "--lines",
+                "10",
+                "--filter",
+                "@httpStatus:404",
+            ]);
+        }
+
+        #[test]
+        fn variable_legacy_flags() {
+            assert_parses(&["variable", "--set", "KEY=value"]);
+            assert_parses(&["variable", "--set", "KEY=value", "--set", "KEY2=value2"]);
+            // Empty VALUE is legal (sets the empty string); it used to fail
+            // clap parsing and abort the whole invocation, other pairs included.
+            assert_parses(&["variable", "--set", "KEY=", "--set", "KEY2=value2"]);
+            assert_parses(&["variable", "-s", "myservice"]);
+            assert_parses(&["variable", "-e", "production"]);
+            assert_parses(&["variable", "--kv"]);
+            assert_parses(&["variable", "--json"]);
+            assert_parses(&["variable", "--skip-deploys", "--set", "KEY=value"]);
+            assert_parses(&["variables", "--set", "KEY=value"]); // via alias
+        }
+
+        #[test]
+        fn environment_implicit_link() {
+            assert_parses(&["environment", "production"]); // legacy positional
+            assert_parses(&["env", "production"]); // alias
+        }
+
+        #[test]
+        fn service_implicit_link() {
+            assert_parses(&["service"]); // prompts for link
+            assert_parses(&["service", "myservice"]); // legacy positional link
+        }
+
+        #[test]
+        fn functions_aliases() {
+            assert_subcommand(&["functions", "list"], "functions");
+            assert_subcommand(&["function", "list"], "functions");
+            assert_subcommand(&["func", "list"], "functions");
+            assert_subcommand(&["fn", "list"], "functions");
+            assert_subcommand(&["funcs", "list"], "functions");
+            assert_subcommand(&["fns", "list"], "functions");
+        }
+
+        #[test]
+        fn dev_run_aliases() {
+            assert_subcommand(&["dev"], "dev");
+            assert_subcommand(&["develop"], "dev");
+            assert_subcommand(&["run"], "run");
+            assert_subcommand(&["local"], "run");
+        }
+
+        #[test]
+        fn variable_set_from_stdin_legacy() {
+            assert_parses(&["variable", "--set-from-stdin", "MY_KEY"]);
+            assert_parses(&["variable", "--set-from-stdin", "KEY", "-s", "myservice"]);
+            assert_parses(&["variable", "--set-from-stdin", "KEY", "--skip-deploys"]);
+            assert_parses(&["variables", "--set-from-stdin", "KEY"]);
+        }
+
+        #[test]
+        fn variable_list_kv_format() {
+            assert_parses(&["variable", "--kv"]);
+            assert_parses(&["variable", "-k"]);
+            assert_parses(&["variables", "--kv"]);
+        }
+    }
+
+    mod new_commands {
+        use super::*;
+
+        #[test]
+        fn variable_subcommands() {
+            assert_parses(&["variable", "list"]);
+            assert_parses(&["variable", "list", "-s", "myservice"]);
+            assert_parses(&["variable", "list", "--json"]);
+            assert_parses(&["variable", "set", "KEY=value"]);
+            assert_parses(&["variable", "set", "KEY=value", "KEY2=value2"]); // multiple
+            assert_parses(&["variable", "set", "A=1", "B=2", "C=3", "--skip-deploys"]);
+            assert_parses(&["variable", "set", "KEY", "--stdin"]);
+            assert_parses(&["variable", "set", "KEY=value", "--skip-deploys"]);
+            assert_parses(&["variable", "delete", "KEY"]);
+            assert_parses(&["variable", "rm", "KEY"]); // alias
+            assert_parses(&["variable", "delete", "KEY", "--json"]);
+        }
+
+        #[test]
+        fn environment_link_subcommand() {
+            assert_parses(&["environment", "link"]);
+            assert_parses(&["environment", "link", "production"]);
+            assert_parses(&["environment", "link", "--json"]);
+        }
+
+        #[test]
+        fn service_subcommands() {
+            assert_parses(&["service", "link"]);
+            assert_parses(&["service", "status"]);
+            assert_parses(&["service", "status", "--all"]);
+            assert_parses(&["service", "status", "--json"]);
+            assert_parses(&["service", "logs"]);
+            assert_parses(&["service", "logs", "-s", "myservice"]);
+            assert_parses(&["service", "redeploy"]);
+            assert_parses(&["service", "redeploy", "-s", "myservice"]);
+            assert_parses(&["service", "restart"]);
+            assert_parses(&[
+                "service",
+                "source",
+                "connect",
+                "--repo",
+                "owner/repo",
+                "--branch",
+                "main",
+                "--service",
+                "web",
+            ]);
+            assert_parses(&[
+                "service",
+                "source",
+                "connect",
+                "--image",
+                "nginx:latest",
+                "--service",
+                "web",
+            ]);
+            assert_parses(&["service", "source", "disconnect", "--service", "web"]);
+            assert_parses(&["service", "scale"]);
+            assert_parses(&["service", "scale", "eu-west=2"]);
+            assert_parses(&["service", "scale", "--eu-west", "2"]);
+            assert_parses(&[
+                "service",
+                "scale",
+                "--service",
+                "worker",
+                "eu-west=2",
+                "us-east=1",
+            ]);
+        }
+
+        #[test]
+        fn tcp_proxy_subcommands() {
+            assert_parses(&["tcp-proxy", "list"]);
+            assert_parses(&["tcp-proxy", "list", "--service", "api", "--json"]);
+            assert_parses(&["tcp-proxy", "create", "--port", "5432"]);
+            assert_parses(&["tcp-proxy", "status", "proxy-id"]);
+            assert_parses(&["tcp-proxy", "delete", "proxy-id", "--yes"]);
+        }
+
+        #[test]
+        fn cdn_subcommands() {
+            assert!(parse(&["cdn"]).is_err());
+            assert_parses(&["cdn", "status"]);
+            assert_parses(&["cdn", "status", "--service", "api", "--json"]);
+            assert_parses(&["cdn", "enable", "--environment", "production"]);
+            assert_parses(&["cdn", "disable", "--service", "web"]);
+            assert_parses(&[
+                "cdn",
+                "update",
+                "--html-caching",
+                "force",
+                "--default-ttl",
+                "4h",
+                "--no-swr",
+                "--purge-on-deploy",
+                "all",
+            ]);
+            assert!(parse(&["cdn", "update"]).is_err());
+            assert!(parse(&["cdn", "update", "--swr", "--no-swr"]).is_err());
+            assert!(parse(&["cdn", "update", "--default-ttl", "3h"]).is_err());
+            assert_parses(&["cdn", "purge", "html"]);
+            assert_parses(&["cdn", "purge", "all", "--json"]);
+            assert!(parse(&["cdn", "purge", "--scope", "html"]).is_err());
+        }
+
+        #[test]
+        fn waf_subcommands() {
+            assert!(parse(&["waf"]).is_err());
+            assert!(parse(&["waf", "under-attack"]).is_err());
+            assert_parses(&["waf", "under-attack", "status"]);
+            assert_parses(&[
+                "waf",
+                "under-attack",
+                "status",
+                "--service",
+                "api",
+                "--json",
+            ]);
+            assert_parses(&["waf", "under-attack", "enable"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "forever"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "1h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "3h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "12h"]);
+            assert_parses(&["waf", "under-attack", "enable", "--duration", "24h"]);
+            assert_parses(&["waf", "under-attack", "disable", "--service", "web"]);
+            assert!(parse(&["waf", "under-attack", "enable", "--duration", "2h"]).is_err());
+        }
+
+        #[test]
+        fn private_network_subcommands() {
+            assert!(parse(&["private-network"]).is_err());
+            assert_parses(&["private-network", "status"]);
+            assert_parses(&["private-network", "status", "--service", "api", "--json"]);
+            assert_parses(&["private-network", "status", "--network", "railway"]);
+            assert_parses(&["private-network", "update", "api-internal"]);
+            assert_parses(&[
+                "private-network",
+                "update",
+                "api-internal",
+                "--network",
+                "railway",
+            ]);
+        }
+
+        #[test]
+        fn add_repo_branch() {
+            assert_parses(&["add", "--repo", "owner/repo", "--branch", "main"]);
+        }
+
+        #[test]
+        fn project_subcommands() {
+            assert_parses(&["project", "list"]);
+            assert_parses(&["projects", "list"]);
+            assert_subcommand(&["projects", "list"], "project");
+            assert_parses(&["project", "ls"]); // alias
+            assert_parses(&["project", "list", "--json"]);
+            assert_parses(&["project", "link"]);
+            assert_parses(&["project", "delete"]);
+            assert_parses(&["project", "rm"]); // alias
+            assert_parses(&["project", "delete", "-y"]);
+        }
+
+        #[test]
+        fn projects_alias_shows_suggestion() {
+            let raw_args = vec!["projects".to_string(), "list".to_string()];
+
+            assert_eq!(
+                project_command_suggestion(&raw_args),
+                Some("I think you meant `railway project`; running that command instead.")
+            );
+        }
+
+        #[test]
+        fn variable_list_aliases() {
+            assert_parses(&["variable", "ls"]);
+            assert_parses(&["variable", "ls", "--kv"]);
+            assert_parses(&["variable", "ls", "-s", "myservice"]);
+        }
+
+        #[test]
+        fn variable_delete_remove_alias() {
+            assert_parses(&["variable", "remove", "KEY"]);
+        }
+
+        #[test]
+        fn variable_set_stdin_key_only() {
+            assert_parses(&["variable", "set", "KEY", "--stdin"]);
+            assert_parses(&["variable", "set", "MY_VAR", "--stdin", "-s", "myservice"]);
+            assert_parses(&["variable", "set", "SECRET", "--stdin", "--skip-deploys"]);
+        }
+
+        #[test]
+        fn setup_agent_subcommand() {
+            assert_subcommand(&["setup", "agent"], "setup");
+            assert_parses(&["setup", "agent"]);
+            assert_parses(&["setup", "agent", "--yes"]);
+            assert_parses(&["setup", "agent", "-y"]);
+            assert_parses(&["setup", "agent", "--remote"]);
+            assert_parses(&["setup", "agent", "--remote", "-y"]);
+            assert_parses(&["setup", "agent", "--local"]);
+            assert_parses(&["setup", "agent", "--local", "-y"]);
+            assert_parses(&["setup", "agent", "--oauth"]);
+            assert_parses(&["setup", "agent", "--oauth", "-y"]);
+        }
+
+        #[test]
+        fn code_get_config_is_local_and_preserves_harness_arguments() {
+            for args in [
+                vec!["code", "get-config"],
+                vec!["code", "get-config", "--json"],
+                vec!["code", "get-config", "my-box"],
+                vec!["code", "get-config", "my-box", "--json"],
+                vec!["code", "get-config", "--json", "my-box"],
+            ] {
+                let matches = parse(&args).unwrap();
+                assert!(is_code_get_config(&matches));
+                assert!(!command_needs_refresh(&matches));
+            }
+            let forwarded = parse(&["code", "--codex", "--", "get-config"]).unwrap();
+            assert!(!is_code_get_config(&forwarded));
+            assert!(command_needs_refresh(&forwarded));
+            assert!(parse(&["code", "get-config", "--new"]).is_err());
+            assert!(parse(&["code", "get-config", "one", "two"]).is_err());
+        }
+
+        #[test]
+        fn cloud_agent_subcommands() {
+            assert_subcommand(&["ca"], "ca");
+            assert_parses(&["ca"]);
+            assert_parses(&["ca", "setup"]);
+            assert_parses(&["ca", "setup", "-y"]);
+            assert_parses(&["ca", "setup", "--show"]);
+            assert_parses(&["ca", "start", "--claude"]);
+            assert_parses(&["ca", "start", "--codex", "--new"]);
+            for verb in ["install", "new", "agents", "sync"] {
+                assert_parses(&["ca", "herdr", verb]);
+            }
+            assert_parses(&["ca", "herdr", "bootstrap"]);
+            assert_parses(&["ca", "herdr", "install", "--print"]);
+            assert_parses(&["ca", "herdr", "install", "--remove"]);
+            assert_parses(&["ca", "herdr", "new", "--dry-run"]);
+            assert_parses(&["ca", "herdr", "new", "--codex", "-p", "proj"]);
+            assert_parses(&["ca", "herdr", "agents", "--remote"]);
+            assert_parses(&["ca", "herdr", "agents", "--wake", "--open"]);
+            assert_parses(&["ca", "herdr", "sync", "--debounce", "30"]);
+            assert_parses(&["ca", "herdr", "sync", "--spawn-watch"]);
+            assert_parses(&["ca", "herdr", "watch", "--foreground"]);
+            assert_parses(&["ca", "herdr", "bootstrap", "my-box", "--claude"]);
+            assert_parses(&["ca", "herdr", "sync", "--dry-run", "--json"]);
+        }
+
+        /// `railway ca` browses and `railway code` launches, but every launch
+        /// flag has to work on both — otherwise the split becomes a trap where
+        /// the flag you know only works on the command you didn't type.
+        #[test]
+        fn both_commands_take_the_same_launch_flags() {
+            for name in ["code", "ca"] {
+                for flags in [
+                    vec!["--claude"],
+                    vec!["--codex", "--new"],
+                    vec!["--grok", "--keep-awake"],
+                    vec!["--rm"],
+                    vec!["--claude", "--refresh-auth"],
+                    vec!["--codex", "--variable", "A=b"],
+                    vec!["--codex", "--env-file", ".env"],
+                    vec!["--claude", "-p", "proj", "-e", "env"],
+                ] {
+                    let args: Vec<&str> = std::iter::once(name).chain(flags).collect();
+                    assert_parses(&args);
+                }
+            }
+        }
+
+        /// The subcommands belong to `ca` alone — `code` is the launcher.
+        #[test]
+        fn subcommands_live_on_ca() {
+            let matches = parse(&["ca", "setup"]).unwrap();
+            let (_, sub) = matches.subcommand().unwrap();
+            assert_eq!(sub.subcommand_name(), Some("setup"));
+
+            // On `code`, `setup` is a trailing agent argument — which is why
+            // `code::command` refuses it with a pointer to `railway ca setup`
+            // rather than running it on the VM.
+            let matches = parse(&["code", "setup"]).unwrap();
+            let (_, sub) = matches.subcommand().unwrap();
+            assert_eq!(sub.subcommand_name(), None);
+            assert_eq!(
+                sub.get_many::<String>("agent_args")
+                    .map(|v| v.cloned().collect::<Vec<_>>()),
+                Some(vec!["setup".to_string()])
+            );
+        }
+
+        #[test]
+        fn trailing_agent_args_survive_on_both_names() {
+            for name in ["code", "ca"] {
+                assert_parses(&[name, "--codex", "--", "exec", "explain this codebase"]);
+            }
+            assert_parses(&["ca", "start", "--codex", "--", "--version"]);
+        }
+
+        #[test]
+        fn api_command_parses() {
+            assert_subcommand(&["api", "{ me { id } }"], "api");
+            assert_parses(&["api", "--file", "query.graphql"]);
+            assert_parses(&[
+                "api",
+                "--file",
+                "query.graphql",
+                "--variables",
+                "@vars.json",
+                "--var",
+                "limit=10",
+                "--raw-var",
+                "name=web",
+                "--operation-name",
+                "Project",
+                "--compact",
+            ]);
+            assert_parses(&[
+                "api",
+                "--file",
+                "query.graphql",
+                "--variables",
+                "@vars.json",
+                "--allow-errors",
+            ]);
+            assert_parses(&["api", "schema"]);
+            assert_parses(&["api", "schema", "--compact"]);
+            assert_parses(&["api", "search", "deployment", "--kind", "mutation"]);
+            assert_parses(&["api", "describe", "ServiceInstanceUpdateInput"]);
+        }
+
+        #[test]
+        fn api_commands_need_auth_refresh() {
+            let search = parse(&["api", "search", "serviceInstance"]).unwrap();
+            let describe = parse(&["api", "describe", "ServiceInstanceUpdateInput"]).unwrap();
+            let schema = parse(&["api", "schema"]).unwrap();
+            let execute = parse(&["api", "{ me { id } }"]).unwrap();
+
+            assert!(command_needs_refresh(&search));
+            assert!(command_needs_refresh(&describe));
+            assert!(command_needs_refresh(&schema));
+            assert!(command_needs_refresh(&execute));
+        }
+
+        #[test]
+        fn template_auth_refresh_is_subcommand_aware() {
+            let search = parse(&["templates", "search"]).unwrap();
+            let find = parse(&["template", "find", "postgres"]).unwrap();
+            let create = parse(&["templates", "create", "--environment", "production"]).unwrap();
+            let publish = parse(&["templates", "publish", "template-id"]).unwrap();
+            let update = parse(&["templates", "update", "template-id"]).unwrap();
+            let unpublish = parse(&["templates", "unpublish", "template-id"]).unwrap();
+            let delete = parse(&["templates", "delete", "template-id"]).unwrap();
+
+            assert!(!command_needs_refresh(&search));
+            assert!(!command_needs_refresh(&find));
+            assert!(command_needs_refresh(&create));
+            assert!(command_needs_refresh(&publish));
+            assert!(command_needs_refresh(&update));
+            assert!(command_needs_refresh(&unpublish));
+            assert!(command_needs_refresh(&delete));
+        }
+
+        #[test]
+        fn mcp_install_subcommand() {
+            assert_parses(&["mcp"]); // no subcommand: still launches server
+            assert_parses(&["mcp", "install"]);
+            assert_parses(&["mcp", "install", "--agent", "cursor"]);
+            assert_parses(&[
+                "mcp",
+                "install",
+                "--agent",
+                "cursor",
+                "--agent",
+                "claude-code",
+            ]);
+            assert_parses(&["mcp", "install", "--remote"]);
+            assert_parses(&["mcp", "install", "--remote", "--agent", "cursor"]);
+            assert_parses(&["mcp", "install", "--remote", "--agent", "codex"]);
+            assert_parses(&["mcp", "install", "--agent", "pi"]);
+            assert_parses(&["mcp", "install", "--remote", "--agent", "pi"]);
+            assert_parses(&["mcp", "install", "--agent", "antigravity"]);
+            assert_parses(&["mcp", "install", "--local"]);
+            assert_parses(&["mcp", "install", "--local", "--agent", "cursor"]);
+            assert_parses(&["mcp", "install", "--oauth"]);
+            assert_parses(&["mcp", "install", "--oauth", "--agent", "cursor"]);
+        }
+
+        #[test]
+        fn config_pinned_plan_flags() {
+            assert_parses(&["config", "plan", "--out", "railway-plan.json"]);
+            assert_parses(&[
+                "config",
+                "plan",
+                "--out",
+                "railway-plan.json",
+                "--source-tree",
+                "abc123",
+            ]);
+            assert_parses(&[
+                "config",
+                "apply",
+                "--plan",
+                "railway-plan.json",
+                "--yes",
+                "--confirm-destructive",
+            ]);
+            assert_parses(&["config", "pull", "--include-variables"]);
+            assert_parses(&["config", "pull", "--include-variables", "--force"]);
+            assert_parses(&["config", "plan", "--environment", "staging"]);
+            assert_parses(&["config", "apply", "--environment", "env_123", "--yes"]);
+            assert_parses(&["config", "pull", "--environment", "staging"]);
+            assert_parses(&[
+                "config",
+                "apply",
+                "--plan",
+                "railway-plan.json",
+                "--environment",
+                "staging",
+                "--yes",
+            ]);
+        }
+    }
 }
